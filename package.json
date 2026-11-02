@@ -1,0 +1,18 @@
+{
+  "name": "agentbridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p packages/protocol && tsc --noEmit -p packages/core && tsc --noEmit -p packages/omp-extension && tsc --noEmit -p packages/mcp-server && tsc --noEmit -p tests/integration && tsc --noEmit -p scripts"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@types/bun": "1.4.3",
+    "typescript": "7.0.2"
+  }
+}

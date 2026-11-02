@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "skills": {
+    "audit-context-building": {
+      "source": "trailofbits/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/audit-context-building/skills/audit-context-building/SKILL.md",
+      "computedHash": "aed6088124a47915aa4708e4fbb9be7383348dbb67bff2b44dd4dcde459699c7"
+    },
+    "build-mcp-server": {
+      "source": "anthropics/claude-plugins-official",
+      "sourceType": "github",
+      "skillPath": "plugins/mcp-server-dev/skills/build-mcp-server/SKILL.md",
+      "computedHash": "b98ddf5944e3a1e2bdaad3d6fc3d2afbe29941595817721971cf41d6da81c81e"
+    },
+    "bun-runtime": {
+      "source": "affaan-m/ecc",
+      "sourceType": "github",
+      "skillPath": "skills/bun-runtime/SKILL.md",
+      "computedHash": "e5917280237b069b37952d8ae3652d91cb6997f0f2fe69256768608927e1104c"
+    },
+    "hook-development": {
+      "source": "anthropics/claude-plugins-official",
+      "sourceType": "github",
+      "skillPath": "plugins/plugin-dev/skills/hook-development/SKILL.md",
+      "computedHash": "7bda9057df5162ac7a141dab5d5b4876c2fa37516eb757f3efc6f7dcebe73aa2"
+    },
+    "mcp-builder": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/mcp-builder/SKILL.md",
+      "computedHash": "863dfe94bc38b62389884e78fee7f0a9c31bd74a6032f602eb84a66f4b8315c9"
+    },
+    "mcp-integration": {
+      "source": "anthropics/claude-plugins-official",
+      "sourceType": "github",
+      "skillPath": "plugins/plugin-dev/skills/mcp-integration/SKILL.md",
+      "computedHash": "984b4bb3ef0fb6fac0fec9dcc4e42df794660f87631c2c3ab29f5e24b3123b89"
+    },
+    "security-threat-model": {
+      "source": "openai/skills",
+      "sourceType": "github",
+      "skillPath": "skills/.curated/security-threat-model/SKILL.md",
+      "computedHash": "b3ad2dc0b2eee1f189680fdb8cf3b17853f12ab3403d389393f4237ebc6f9821"
+    }
+  }
+}

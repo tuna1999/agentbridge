@@ -1,0 +1,15 @@
+{
+  "name": "agentbridge",
+  "description": "AgentBridge plugins for Claude Code.",
+  "owner": {
+    "name": "AgentBridge"
+  },
+  "plugins": [
+    {
+      "name": "agentbridge",
+      "source": "./plugins/claude",
+      "version": "0.1.0",
+      "description": "Bridge OMP and Claude Code sessions through a shared MCP server."
+    }
+  ]
+}

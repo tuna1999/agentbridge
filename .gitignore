@@ -1,0 +1,16 @@
+node_modules
+dist/
+!plugins/claude/dist/
+!plugins/claude/dist/**
+!plugins/omp/dist/
+!plugins/omp/dist/**
+spike/*.log
+.env
+.env.*
+*.log
+
+# Third-party skills: restore locally from skills-lock.json, not redistributed here.
+.agents/skills/*
+!.agents/skills/omp-extension-v18/
+.claude/skills/*
+!.claude/skills/omp-extension-v18

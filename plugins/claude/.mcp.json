@@ -1,0 +1,8 @@
+{
+  "agentbridge": {
+    "command": "bun",
+    "args": [
+      "${CLAUDE_PLUGIN_ROOT}/dist/mcp-server.js"
+    ]
+  }
+}

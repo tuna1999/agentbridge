@@ -1,0 +1,9 @@
+{
+  "name": "agentbridge",
+  "version": "0.1.0",
+  "description": "Bridge OMP and Claude Code sessions through a shared MCP server.",
+  "author": {
+    "name": "AgentBridge"
+  },
+  "license": "Apache-2.0"
+}

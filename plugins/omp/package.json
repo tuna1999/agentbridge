@@ -1,0 +1,13 @@
+{
+  "name": "agentbridge",
+  "version": "0.1.0",
+  "description": "Bridge OMP and Claude Code sessions through a shared MCP server.",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "omp": {
+    "extensions": [
+      "./dist/agentbridge.js"
+    ]
+  }
+}
