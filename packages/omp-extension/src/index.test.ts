@@ -99,17 +99,14 @@ function makeCtx(
 function makePi(sessionName?: string): {
 	pi: PiLike;
 	handlers: Map<OmpEventName, OmpEventHandler[]>;
-	commands: Map<string, { description?: string; handler: (args: string, ctx: OmpContextLike) => Promise<void> | void }>;
+	commands: Map<string, Parameters<PiLike["registerCommand"]>[1]>;
 	flags: Map<string, { description?: string; type: "boolean" | "string"; default?: boolean | string }>;
 	getFlag(name: string): boolean | string | undefined;
 	fire(event: OmpEventName, ctx: OmpContextLike, payload?: OmpAgentEndLike): Promise<void>;
 	run(args: string, ctx: OmpContextLike): Promise<void>;
 } {
 	const handlers = new Map<OmpEventName, OmpEventHandler[]>();
-	const commands = new Map<
-		string,
-		{ description?: string; handler: (args: string, ctx: OmpContextLike) => Promise<void> | void }
-	>();
+	const commands = new Map<string, Parameters<PiLike["registerCommand"]>[1]>();
 	const flags = new Map<
 		string,
 		{ description?: string; type: "boolean" | "string"; default?: boolean | string }
@@ -278,6 +275,9 @@ test("factory registers handlers and command without I/O", () => {
 	];
 	expect([...handlers.keys()].sort()).toEqual(expectedEvents.sort());
 	expect(commands.has("agentbridge")).toBe(true);
+	expect(commands.get("agentbridge")?.getArgumentCompletions?.("auto")?.map((item) => item.value)).toEqual([
+		"autochat ",
+	]);
 	expect(flags.get(AUTOCHAT_FLAG)).toMatchObject({ type: "string" });
 	expect(flags.get(AUTOCHAT_FLAG)?.default).toBeUndefined();
 	expect(existsSync(dirs.runtimeDir)).toBe(false);

@@ -2,7 +2,7 @@
 // packages/omp-extension/package.json
 var package_default = {
   name: "@agentbridge/omp-extension",
-  version: "0.1.0",
+  version: "0.1.1",
   private: true,
   type: "module",
   exports: { ".": "./src/index.ts" },
@@ -1927,6 +1927,45 @@ function bridgeStatusText(base, state, chatEnabled) {
     return `${base} \xB7 autochat ${state.used}/${state.quota ?? 0}`;
   }
   return `${base} \xB7 autochat \u221E \xB7 ${state.used} tin`;
+}
+
+// packages/omp-extension/src/completions.ts
+var AGENTBRIDGE_SUBCOMMANDS = [
+  { name: "status", description: "Tr\u1EA1ng th\xE1i server, phi\xEAn v\xE0 autochat" },
+  { name: "trust", description: "Tin c\u1EADy phi\xEAn n\xE0y (ch\u1EC9 trong b\u1ED9 nh\u1EDB)" },
+  { name: "untrust", description: "B\u1ECF tin c\u1EADy phi\xEAn n\xE0y" },
+  { name: "autochat", description: "Ch\u1EBF \u0111\u1ED9 t\u1EF1 duy\u1EC7t: off | limited [ph\xFAt] | unlimited" },
+  { name: "allow", description: "Cho ph\xE9p project hi\u1EC7n t\u1EA1i" },
+  { name: "disallow", description: "B\u1ECF cho ph\xE9p project hi\u1EC7n t\u1EA1i" },
+  { name: "config", description: "Xem c\u1EA5u h\xECnh AgentBridge" },
+  { name: "off", description: "T\u1EAFt server cho phi\xEAn n\xE0y" },
+  { name: "on", description: "B\u1EADt l\u1EA1i server cho phi\xEAn n\xE0y" },
+  { name: "clear", description: "Xo\xE1 widget" }
+];
+var AUTOCHAT_MODES = [
+  { name: "off", description: "T\u1EAFt autochat" },
+  { name: "limited", description: "T\u1EF1 duy\u1EC7t c\xF3 gi\u1EDBi h\u1EA1n, tu\u1EF3 ch\u1ECDn s\u1ED1 ph\xFAt (t\u1ED1i \u0111a 480)" },
+  { name: "unlimited", description: "T\u1EF1 duy\u1EC7t kh\xF4ng gi\u1EDBi h\u1EA1n" }
+];
+function match2(choices, typed, lead) {
+  const lower = typed.toLowerCase();
+  const items = choices.filter((choice) => choice.name.startsWith(lower)).map((choice) => ({ value: `${lead}${choice.name} `, label: choice.name, description: choice.description }));
+  return items.length > 0 ? items : null;
+}
+function agentbridgeArgumentCompletions(argumentPrefix) {
+  const leading = argumentPrefix.match(/^\s*/)?.[0] ?? "";
+  const rest = argumentPrefix.slice(leading.length);
+  const space = rest.search(/\s/);
+  if (space === -1)
+    return match2(AGENTBRIDGE_SUBCOMMANDS, rest, leading);
+  const sub = rest.slice(0, space).toLowerCase();
+  if (sub !== "autochat")
+    return null;
+  const afterSub = rest.slice(space).replace(/^\s+/, "");
+  if (/\s/.test(afterSub))
+    return null;
+  const lead = argumentPrefix.slice(0, argumentPrefix.length - afterSub.length);
+  return match2(AUTOCHAT_MODES, afterSub, lead);
 }
 
 // packages/omp-extension/src/lifecycle.ts
@@ -4508,6 +4547,7 @@ function agentbridgeExtension(pi) {
   });
   pi.registerCommand("agentbridge", {
     description: "AgentBridge: status, trust, untrust, autochat, allow, disallow, config, off, on, clear",
+    getArgumentCompletions: agentbridgeArgumentCompletions,
     handler: async (args, ctx) => {
       try {
         await host.command(args, ctx);

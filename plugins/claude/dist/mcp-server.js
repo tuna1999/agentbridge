@@ -6976,7 +6976,7 @@ var require_dist = __commonJS(function(exports, module) {
 // packages/mcp-server/package.json
 var package_default = {
   name: "@agentbridge/mcp-server",
-  version: "0.1.0",
+  version: "0.1.1",
   private: true,
   type: "module",
   exports: {

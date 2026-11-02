@@ -6,6 +6,7 @@
  * without loading OMP. Accessors are defensive: a host mismatch must never crash OMP.
  */
 import type { ModelRef } from "@agentbridge/protocol";
+import type { CompletionItem } from "./completions";
 
 export type OmpTimer = unknown;
 export type OmpUiMessageType = "info" | "warning" | "error";
@@ -182,6 +183,8 @@ export interface PiLike {
   name: string,
   options: {
    description?: string;
+   /** extension-types.v18.14.0.ts.txt:1772; value replaces the whole argument text. */
+   getArgumentCompletions?: (argumentPrefix: string) => CompletionItem[] | null;
    handler: (args: string, ctx: OmpContextLike) => Promise<void> | void;
   },
  ): void;

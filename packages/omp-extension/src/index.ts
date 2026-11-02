@@ -7,6 +7,7 @@
  */
 import packageJson from "../package.json";
 import { AUTOCHAT_FLAG } from "./autochat";
+import { agentbridgeArgumentCompletions } from "./completions";
 import { Host } from "./lifecycle";
 import {
  type OmpAgentEndLike,
@@ -188,6 +189,7 @@ export default function agentbridgeExtension(pi: PiLike): void {
 
  pi.registerCommand("agentbridge", {
   description: "AgentBridge: status, trust, untrust, autochat, allow, disallow, config, off, on, clear",
+  getArgumentCompletions: agentbridgeArgumentCompletions,
   handler: async (args: string, ctx: OmpContextLike) => {
    try {
     await host.command(args, ctx);
