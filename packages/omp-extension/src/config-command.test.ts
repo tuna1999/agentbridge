@@ -256,8 +256,8 @@ test("a confirmation that times out in OMP's selector never writes", async () =>
 
 	await makeHost().command("allow", ctx);
 
-	expect(ctx.selections[0]?.dialogOptions?.initialIndex).toBe(1);
-	expect(ctx.selections[0]?.options[1]).toBe("Từ chối");
+	expect(ctx.selections[0]?.dialogOptions?.initialIndex).toBe(0);
+	expect(ctx.selections[0]?.options[0]).toBe("Từ chối");
 	expect(existsSync(env.config)).toBe(false);
 	expect(lastMessage(ctx)).toContain("đã huỷ");
 });

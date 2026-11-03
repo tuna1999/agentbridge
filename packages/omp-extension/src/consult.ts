@@ -6,6 +6,7 @@
  */
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
 import {
+ CONSENT_TOTAL_MAX_MS,
  CONSULT_CONCURRENCY,
  type ConsultAttachment,
  type ConsultBody,
@@ -45,12 +46,12 @@ import { buildConsentView, callerLabel, runPagedConsent, sanitizeDialogText } fr
 import { CONSENT_TEXT, CONSULT_TEXT } from "./messages";
 import { buildPrompt, locationOf } from "./prompt";
 
-/** Choices offered by `ctx.ui.select`; the API returns the selected label. */
-export const CONSENT_OPTIONS: readonly string[] = [
- CONSULT_TEXT.allowOnce,
- CONSULT_TEXT.allowSession,
- CONSULT_TEXT.deny,
-];
+const CONSENT_APPROVE_OPTIONS: readonly string[] = [CONSULT_TEXT.allowOnce, CONSULT_TEXT.allowSession];
+/**
+ * The last consent dialog's choices as `ctx.ui.select` shows them, deny first
+ * (01 §7.4 step 7); the API returns the selected label.
+ */
+export const CONSENT_OPTIONS: readonly string[] = [CONSULT_TEXT.deny, ...CONSENT_APPROVE_OPTIONS];
 export const CONSENT_TITLE = CONSULT_TEXT.consentTitle;
 const CONSENT_SESSION_CHARS = 128;
 /** Attachment locations listed in the consent dialog before "… và K tệp khác". */
@@ -597,13 +598,10 @@ export class ConsultManager {
      if (choice === undefined) {
       throw new ConsultFailure("consent_timeout", "consent dialog timed out");
      }
-     if (choice === CONSENT_OPTIONS[2]) {
+     if (choice !== CONSULT_TEXT.allowOnce && choice !== CONSULT_TEXT.allowSession) {
       throw new ConsultFailure("denied", "user declined the consult", "denied");
      }
-     if (choice === CONSENT_OPTIONS[1]) request.trustSession();
-     if (choice !== CONSENT_OPTIONS[0] && choice !== CONSENT_OPTIONS[1]) {
-      throw new ConsultFailure("denied", "user declined the consult", "denied");
-     }
+     if (choice === CONSULT_TEXT.allowSession) request.trustSession();
     }
     if (request.signal.aborted) {
      throw new ConsultFailure("cancelled", "client disconnected before the turn");
@@ -825,8 +823,8 @@ export class ConsultManager {
 
  /**
   * §7.4 step 7: snippet dialog, then "Xem toàn văn" pages when the snippet
-  * hides anything; approval is only offered once everything was shown.
-  * `consentTimeoutMs` is one deadline shared by every dialog.
+  * hides anything; approval is only offered once everything was shown. Each
+  * dialog gets `consentTimeoutMs`; `CONSENT_TOTAL_MAX_MS` caps the exchange.
   */
  async #selectConsent(
   request: ConsultRequest,
@@ -834,19 +832,16 @@ export class ConsultManager {
   payload: { question: string; attachments: ConsultAttachment[] },
  ): Promise<string | undefined> {
   const view = buildConsentView(payload.question);
-  const deadline = Date.now() + config.consult.consentTimeoutMs;
   return runPagedConsent({
    view,
    title: (body, page) => consentTitle(request, payload.attachments, view.sizeLine, body, page),
-   finalOptions: CONSENT_OPTIONS,
+   approveOptions: CONSENT_APPROVE_OPTIONS,
    denyOption: CONSULT_TEXT.deny,
-   beforeDialog: () => {
-    if (Date.now() >= deadline) throw new ConsultFailure("consent_timeout", "consent dialog timed out");
-   },
-   expired: () => Date.now() >= deadline,
-   select: async (title, options, initialIndex) => {
+   dialogTimeoutMs: config.consult.consentTimeoutMs,
+   totalTimeoutMs: CONSENT_TOTAL_MAX_MS,
+   select: async (title, options, initialIndex, timeoutMs) => {
     const dialogOptions: OmpDialogOptions = {
-     timeout: Math.max(1, deadline - Date.now()),
+     timeout: timeoutMs,
      signal: request.signal,
      initialIndex,
     };

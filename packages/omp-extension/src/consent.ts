@@ -9,9 +9,14 @@
  * reaches the model fenced as data that must not be followed (01 §7.5).
  *
  * A timeout is never an approval: OMP's selector picks the highlighted option
- * when its countdown ends, so the adapter turns that into `undefined`, the deny
- * option is the highlighted one, and an answer after the shared deadline counts
- * as a timeout.
+ * when its countdown ends, so the adapter turns that into `undefined`; the deny
+ * option comes first and is highlighted, so a host that ignores `onTimeout` or
+ * `initialIndex` still lands on it; and an answer after a dialog's deadline
+ * counts as a timeout.
+ *
+ * Each dialog has its own `consentTimeoutMs`: paging proves the operator is
+ * present, so a long payload is not cut off by a budget sized for one dialog.
+ * `CONSENT_TOTAL_MAX_MS` bounds the whole exchange.
  */
 import { sanitizeLabel, sanitizeText } from "@agentbridge/protocol";
 import { CONSENT_TEXT } from "./messages";
@@ -124,53 +129,69 @@ export interface PagedConsentOptions {
 	view: ConsentView;
 	/** Dialog title for the snippet (`page` undefined) or for one page of the full text. */
 	title(body: string, page?: { index: number; total: number }): string;
-	/** Options offered once the operator has seen everything; must include `denyOption`. */
-	finalOptions: readonly string[];
+	/** Approving options, offered once the operator has seen everything. */
+	approveOptions: readonly string[];
 	denyOption: string;
+	/** Budget for each dialog, counted from the moment it opens. */
+	dialogTimeoutMs: number;
+	/** Budget for the whole exchange; never shorter than one dialog's budget. */
+	totalTimeoutMs: number;
 	/**
-	 * Shows one dialog; resolves to the chosen label, or `undefined` on
-	 * timeout/dismiss. `initialIndex` is the deny option: OMP highlights it, so a
-	 * reflexive Enter (or a host that auto-picks on timeout) cannot approve.
+	 * Shows one dialog for at most `timeoutMs`; resolves to the chosen label, or
+	 * `undefined` on timeout/dismiss. `options[initialIndex]` is the deny option:
+	 * OMP highlights it, so a reflexive Enter (or a host that auto-picks on
+	 * timeout) cannot approve.
 	 */
-	select(title: string, options: string[], initialIndex: number): Promise<string | undefined>;
-	/** Throws to stop (deadline passed, request settled). Runs before every dialog. */
+	select(title: string, options: string[], initialIndex: number, timeoutMs: number): Promise<string | undefined>;
+	/** Throws to stop (request settled). Runs before every dialog. */
 	beforeDialog?(): void;
-	/** True once the shared deadline passed; an answer arriving after it counts as a timeout. */
-	expired?(): boolean;
+	/** Clock for the deadlines; defaults to `Date.now`. */
+	now?(): number;
 }
 
 /**
  * Snippet dialog, then "Xem toàn văn" pages when the snippet hides anything.
- * Resolves to a label from `finalOptions`, `denyOption` for any unexpected
- * choice, or `undefined` when a dialog timed out or was dismissed.
+ * Every dialog lists `denyOption` first. Resolves to a label from
+ * `approveOptions`, `denyOption` for any other choice, or `undefined` when a
+ * dialog timed out, was dismissed, or the total budget ran out.
  */
 export async function runPagedConsent(options: PagedConsentOptions): Promise<string | undefined> {
+	const now = options.now ?? (() => Date.now());
+	const dialogMs = Math.max(1, options.dialogTimeoutMs);
+	const totalDeadline = now() + Math.max(dialogMs, options.totalTimeoutMs);
+	const approvals = options.approveOptions.filter((label) => label !== options.denyOption);
+
+	/** One dialog; a choice made at or after its deadline is a timeout. */
+	const ask = async (body: string, page: { index: number; total: number } | undefined, labels: string[]) => {
+		options.beforeDialog?.();
+		const opened = now();
+		const deadline = Math.min(opened + dialogMs, totalDeadline);
+		if (opened >= deadline) return undefined;
+		const offered = [options.denyOption, ...labels];
+		const choice = await options.select(options.title(body, page), offered, 0, deadline - opened);
+		return choice !== undefined && now() >= deadline ? undefined : choice;
+	};
 	const finalChoice = (choice: string | undefined): string | undefined => {
 		if (choice === undefined) return undefined;
-		return options.finalOptions.includes(choice) ? choice : options.denyOption;
-	};
-	const ask = async (title: string, labels: string[]): Promise<string | undefined> => {
-		const choice = await options.select(title, labels, Math.max(0, labels.indexOf(options.denyOption)));
-		return choice !== undefined && options.expired?.() === true ? undefined : choice;
+		return approvals.includes(choice) ? choice : options.denyOption;
 	};
 
-	options.beforeDialog?.();
 	if (!options.view.truncated) {
-		return finalChoice(await ask(options.title(options.view.snippet), [...options.finalOptions]));
+		return finalChoice(await ask(options.view.snippet, undefined, approvals));
 	}
 
 	// The snippet is not the whole payload: nothing can be approved yet.
-	const initial = await ask(options.title(options.view.snippet), [CONSENT_TEXT.viewFull, options.denyOption]);
+	const initial = await ask(options.view.snippet, undefined, [CONSENT_TEXT.viewFull]);
 	if (initial === undefined) return undefined;
 	if (initial !== CONSENT_TEXT.viewFull) return options.denyOption;
 
 	const pages = paginateText(options.view.full);
 	for (let index = 0; index < pages.length; index += 1) {
-		options.beforeDialog?.();
 		const last = index === pages.length - 1;
 		const choice = await ask(
-			options.title(pages[index] ?? "", { index: index + 1, total: pages.length }),
-			last ? [...options.finalOptions] : [CONSENT_TEXT.nextPage, options.denyOption],
+			pages[index] ?? "",
+			{ index: index + 1, total: pages.length },
+			last ? approvals : [CONSENT_TEXT.nextPage],
 		);
 		if (choice === undefined) return undefined;
 		if (last) return finalChoice(choice);

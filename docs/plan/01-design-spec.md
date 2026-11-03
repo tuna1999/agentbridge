@@ -1,6 +1,6 @@
 # AgentBridge — Đặc tả thiết kế v1 (MVP)
 
-> Phiên bản đặc tả: 1.2 · Ngày: 2026-11-03 (1.2: sau audit — consent hiện đúng payload, §5.3 làm sạch văn bản, khung trả lời không thể bị đóng sớm, CLI/installer an toàn hơn)
+> Phiên bản đặc tả: 1.2 · Ngày: 2026-11-04 (1.2: sau audit — consent hiện đúng payload, hết giờ không bao giờ là đồng ý, "Từ chối" đứng đầu, hạn tính theo từng hộp, §5.3 làm sạch văn bản, khung trả lời không thể bị đóng sớm, CLI/installer an toàn hơn)
 > Mục tiêu tương thích: OMP **18.14.x** (đã xác minh tại tag `v18.14.0`; GATE T0 chạy trên 18.14.0), Claude Code **≥ 2.1.145**, Bun **≥ 1.4**.
 > T12 (opt-in chat) bổ sung chế độ gửi tin vào transcript OMP; mặc định tắt.
 > Quy ước: **PHẢI / KHÔNG ĐƯỢC / NÊN** mang nghĩa như MUST / MUST NOT / SHOULD.
@@ -206,7 +206,7 @@ interface ErrorBody { code: ErrorCode; message: string; retryable: boolean; deta
 | `too_large` | false | Frame hoặc question vượt giới hạn |
 | `project_not_allowed` | false | Project không có trong allowlist |
 | `denied` | false | Người dùng từ chối, hoặc consent = deny |
-| `consent_timeout` | true | Hết `consentTimeoutMs` |
+| `consent_timeout` | true | Một hộp xác nhận hết `consentTimeoutMs`, hoặc cả lượt hết `CONSENT_TOTAL_MAX_MS` |
 | `busy` | true | OMP đang bận (chat.queueWhenBusy=false) hoặc đã có chat khác đang chờ |
 | `busy_limit` | true | Đã có consult đang chạy |
 | `chat_disabled` | false | `chat.enabled=false` |
@@ -257,7 +257,7 @@ Nguyên tắc: **chuỗi người dùng duyệt = chuỗi model nhận** (với 
   "allowFrom": ["claude-code"],
   "consult": {
     "consent": "ask",              // "ask" | "session" | "always" | "deny"
-    "consentTimeoutMs": 60000,
+    "consentTimeoutMs": 60000,     // cho mỗi hộp xác nhận (§7.4 bước 7)
     "maxQuestionBytes": 32768,
     "maxAttachmentBytes": 65536,   // tổng
     "maxContextBytes": 1048576,
@@ -270,7 +270,7 @@ Nguyên tắc: **chuỗi người dùng duyệt = chuỗi model nhận** (với 
   "chat": {
     "enabled": false,              // T12: mặc định tắt; bật mới quảng bá capability "chat"
     "queueWhenBusy": false,        // true: deliverAs "followUp"; không bao giờ "steer"
-    "consentTimeoutMs": 120000,    // timeout dialog Gửi/Từ chối của chat
+    "consentTimeoutMs": 120000,    // cho mỗi hộp xác nhận của chat (§7.4b bước 8)
     "autoApprove": "off",          // T12b: "off" | "limited" | "unlimited"; snapshot ở session_start
     "autoMaxChars": 2000,          // limited: trần code point; clamp tối đa 8000
     "autoMaxMessages": 20,         // limited: quota cả phiên; clamp tối đa 50
@@ -389,14 +389,16 @@ sock.on("close") → abortController.abort()
      Hộp xác nhận "AgentBridge: Claude Code muốn hỏi ý kiến" hiển thị: tối đa 8 dòng / 300 ký tự
      đầu của payload (kèm "…" nếu bị cắt), "Kích thước: N dòng · M ký tự" + "(đã ẩn K ký tự)",
      "Đính kèm: <n> · caller session: <id>" và tối đa 10 dòng "• path:start-end".
-     Payload vừa snippet → ["Cho phép lần này", "Cho phép trong phiên này", "Từ chối"].
-     Bị cắt → ["Xem toàn văn", "Từ chối"], rồi các trang ["Trang sau", "Từ chối"]; chỉ trang cuối có
-     ba lựa chọn trên. consentTimeoutMs là một deadline chung cho mọi hộp (mỗi select nhận phần còn lại).
+     Payload vừa snippet → ["Từ chối", "Cho phép lần này", "Cho phép trong phiên này"].
+     Bị cắt → ["Từ chối", "Xem toàn văn"], rồi các trang ["Từ chối", "Trang sau"]; chỉ trang cuối có
+     ba lựa chọn trên. Mỗi hộp có consentTimeoutMs riêng, tính từ lúc hộp mở (người đang lật trang là
+     người đang có mặt); CONSENT_TOTAL_MAX_MS chặn tổng thời gian cả lượt, không bao giờ ngắn hơn một hộp.
      undefined (timeout) → consent_timeout ; "Từ chối"/nhãn lạ → denied ; "…phiên này" → sessionTrusted = true
      Hết giờ KHÔNG BAO GIỜ là đồng ý: selector TUI của OMP 18.14 (pi-tui hook-selector) khi hết đếm ngược gọi
      `onTimeout` rồi tự chọn mục đang được highlight. Adapter (`omp.ts`) truyền `onTimeout` và trả `undefined`
-     khi nó đã chạy; mọi hộp xác nhận (consult, chat, /agentbridge allow|disallow) đặt `initialIndex` vào
-     "Từ chối"/nút từ chối; câu trả lời về sau deadline chung cũng bị coi là timeout.
+     khi nó đã chạy; mọi hộp xác nhận (consult, chat, /agentbridge allow|disallow) đặt "Từ chối" ở đầu danh
+     sách và `initialIndex` = 0, nên host bỏ qua `onTimeout` lẫn `initialIndex` vẫn tự chọn từ chối; câu trả
+     lời đến từ hạn của hộp đó trở đi cũng bị coi là timeout.
 8. send progress{phase:"running"}
 9. prompt = buildPrompt(payload.question, payload.attachments)   (7.5)
 10. opts = { promptText: prompt, tools: cfg.toolsOff ? false : undefined, maxContextBytes,
@@ -433,14 +435,14 @@ Lưu ý: `runEphemeralTurn` **không** được gọi bên trong event handler c
    dialog hiển thị đúng payload này và frame gửi đi cũng dùng nó.
    Dialog hiển thị caller (agent + sessionId), payload và
    "Kích thước: N dòng · M ký tự"; nếu snippet bị cắt thêm "(đã ẩn K ký tự)".
-   - Tin vừa snippet: ["Gửi", "Từ chối"].
-   - Tin dài: dialog đầu ["Xem toàn văn", "Từ chối"] (KHÔNG có Gửi).
+   - Tin vừa snippet: ["Từ chối", "Gửi"].
+   - Tin dài: dialog đầu ["Từ chối", "Xem toàn văn"] (KHÔNG có Gửi).
      "Xem toàn văn" chia nội dung đầy đủ thành các trang, mỗi trang dùng ctx.ui.select:
-       trang chưa cuối → ["Trang sau", "Từ chối"]
-       trang cuối     → ["Gửi", "Từ chối"]
+       trang chưa cuối → ["Từ chối", "Trang sau"]
+       trang cuối     → ["Từ chối", "Gửi"]
      Vì vậy không có lựa chọn Gửi trước khi trang cuối được hiển thị.
-   cfg.chat.consentTimeoutMs là một deadline chung cho snippet + mọi trang;
-   mỗi lần select nhận phần thời gian còn lại, không reset.
+   Mỗi hộp có cfg.chat.consentTimeoutMs riêng (như §7.4 bước 7); CONSENT_TOTAL_MAX_MS chặn tổng,
+   và không hộp nào kéo dài quá timeout của chat body.
    audit consent = "manual"
    undefined (dialog timeout) → consent_timeout ; "Từ chối" → denied
 9. kiểm tra lại ctx.isIdle(); nếu bận và !queueWhenBusy → busy
@@ -704,6 +706,7 @@ Cờ: `--cờ giá-trị` hoặc `--cờ=giá-trị`; giá trị không được
 | CLOCK_SKEW_MS | 300 000 |
 | AUTH_FAIL_LIMIT_PER_MIN / LOCKOUT_MS | 10 / 30 000 |
 | CONSULT_CONCURRENCY | 1 |
+| CONSENT_TOTAL_MAX_MS | 300 000 (trần tổng một lượt xác nhận nhiều trang; mỗi hộp vẫn có `consentTimeoutMs` riêng) |
 | AUTO_MAX_CHARS / AUTO_MAX_MESSAGES / AUTO_MIN_INTERVAL_MS | mặc định 2 000 / 20 / 10 000; clamp 8 000 / 50 / 2 000 |
 | AUTOCHAT_LIMITED_MAX_MINUTES | 480 |
 | CHAT_TIMEOUT_MAX_MS | 1 800 000 (trần `ChatBody.timeoutMs`; MCP `timeout_s` 10–1800) |

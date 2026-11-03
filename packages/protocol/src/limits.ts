@@ -13,6 +13,12 @@ export const CONSULT_CONCURRENCY = 1;
 
 /** Default `consult.maxQuestionBytes` from config (01 §6); callers may override. */
 export const DEFAULT_MAX_QUESTION_BYTES = 32_768;
+/**
+ * Cap on one paged consent exchange (01 §7.4 step 7). Each dialog also gets its
+ * own `consentTimeoutMs`, so an operator who keeps paging is never cut off by
+ * a budget sized for one dialog, and an absent one still times out per dialog.
+ */
+export const CONSENT_TOTAL_MAX_MS = 300_000;
 /** T12 chat body timeout ceiling (matches the MCP tool's 1800 s maximum). */
 export const CHAT_TIMEOUT_MAX_MS = 1_800_000;
 /** Per-file attachment cap from the path guard (01 §5.2): 256 KiB. */

@@ -335,6 +335,21 @@ test("consent denial and dialog timeout never send the message", async () => {
 	expect(fake.selectCalls[0]?.title).toContain("caller-session-abcdef");
 });
 
+test("no chat consent dialog outlives the chat body's timeout", async () => {
+	const env = setupEnv();
+	writeConfig({ root: env.root, chat: { enabled: true, consentTimeoutMs: 60_000 } });
+	const fake = makeOmp();
+	const manager = new ChatManager(fake.omp);
+	fake.selectHandler = () => CHAT_DENY_OPTION;
+
+	const error = await rejection(manager.handle(chatRequest(fake, env.root, { timeoutMs: 3_000 })));
+
+	expect(error.code).toBe("denied");
+	const timeout = fake.selectCalls[0]?.dialogOptions?.timeout ?? -1;
+	expect(timeout).toBeGreaterThan(0);
+	expect(timeout).toBeLessThanOrEqual(3_000);
+});
+
 test("busy is returned when OMP is busy unless queueWhenBusy is true", async () => {
 	const env = setupEnv();
 	const fake = makeOmp({ idle: false });
@@ -515,6 +530,7 @@ test("a 2000-character message shows its tail before Gửi is offered", async ()
 		titles.push(title);
 		timeouts.push(dialogOptions?.timeout ?? -1);
 		const labels = options.map((option) => (typeof option === "string" ? option : option.label));
+		expect(labels[0]).toBe(CHAT_DENY_OPTION);
 		if (labels.includes(CHAT_VIEW_FULL_OPTION)) {
 			expect(labels).not.toContain(CHAT_SEND_OPTION);
 			expect(title).toContain("Kích thước:");
@@ -541,10 +557,8 @@ test("a 2000-character message shows its tail before Gửi is offered", async ()
 	expect(titles.at(-1)).toContain(tail);
 	expect(titles[0]).toContain("2 dòng · 2000 ký tự");
 	expect(titles[0]).toContain("(đã ẩn 1700 ký tự)");
+	// Every dialog gets chat.consentTimeoutMs, bounded by the 5 s chat body.
 	expect(timeouts.every((value) => value > 0 && value <= 4_000)).toBe(true);
-	for (let index = 1; index < timeouts.length; index += 1) {
-		expect(timeouts[index]).toBeLessThanOrEqual(timeouts[index - 1] ?? 0);
-	}
 
 	manager.messageStart(fake.ctx, { message: userFrame(frame) });
 	manager.agentEnd(fake.ctx, {

@@ -163,7 +163,7 @@ Config được đọc lại ở mỗi request (cache theo mtime), không cần 
 | `consult.toolsOff` | `true` | Truyền `tools: false` cho lượt consult |
 | `chat.enabled` | `false` | Bật chế độ chat; chỉ khi bật extension mới quảng bá capability `chat` |
 | `chat.queueWhenBusy` | `false` | `true`: khi OMP bận thì xếp tin bằng `deliverAs: "followUp"`; `false`: trả `busy`. Không bao giờ dùng `steer` |
-| `chat.consentTimeoutMs` | `120000` | Thời gian chờ hộp xác nhận Gửi/Từ chối cho mỗi tin chat |
+| `chat.consentTimeoutMs` | `120000` | Thời gian chờ cho mỗi hộp xác nhận của chat (mỗi trang có hạn riêng) |
 | `chat.autoApprove` | `off` | `off`: hỏi từng tin; `limited`: tự chấp nhận trong giới hạn; `unlimited`: tự chấp nhận mọi tin. Chỉ đọc ở `session_start` của main TUI |
 | `chat.autoMaxChars` | `2000` | `limited`: trần số code point của một tin được tự chấp nhận; giá trị > 8000 bị kẹp về 8000 |
 | `chat.autoMaxMessages` | `20` | `limited`: số tin tự chấp nhận tối đa trong cả phiên OMP; giá trị > 50 bị kẹp về 50 |
@@ -222,9 +222,9 @@ Nếu OMP mở **không** có `-e`, hoặc Claude mở **không** có `--mcp-con
 
 Claude sẽ gọi `agent_list` (nếu cần) rồi `agent_consult` hoặc `agent_chat`. Với consult, lần đầu OMP hiện hộp xác nhận: cho phép một lần, cho phép trong phiên, hoặc từ chối. Từ chối thì Claude nhận `denied` và không được tự thử lại. Với chat, OMP hỏi Gửi/Từ chối cho từng tin, **trừ khi** người dùng đã bật autochat; `/agentbridge trust` của consult không bỏ qua bước này.
 
-Hộp xác nhận consult hiện câu hỏi (tối đa 8 dòng / 300 ký tự), dòng `Kích thước: N dòng · M ký tự`, số và đường dẫn các file đính kèm, cùng session của caller. Nếu phần xem trước bị cắt, dòng kích thước ghi thêm `(đã ẩn K ký tự)` và hộp đầu tiên chỉ có **Xem toàn văn/Từ chối**: các nút cho phép chỉ xuất hiện ở trang cuối, sau khi đã hiện hết câu hỏi (giống chat). `consult.consentTimeoutMs` là hạn chót chung cho mọi trang. Mỗi trang khoảng 1 000 ký tự / 14 dòng: câu hỏi 3 000 ký tự cần khoảng 5 hộp thoại, 8 000 ký tự khoảng 10, nên với mặc định 60 giây câu hỏi rất dài khó duyệt kịp. Code nên đi qua `include_files` (hộp xác nhận chỉ liệt kê đường dẫn); nếu thường xuyên hỏi dài, tăng `consult.consentTimeoutMs`.
+Hộp xác nhận consult hiện câu hỏi (tối đa 8 dòng / 300 ký tự), dòng `Kích thước: N dòng · M ký tự`, số và đường dẫn các file đính kèm, cùng session của caller. Nếu phần xem trước bị cắt, dòng kích thước ghi thêm `(đã ẩn K ký tự)` và hộp đầu tiên chỉ có **Từ chối/Xem toàn văn**: các nút cho phép chỉ xuất hiện ở trang cuối, sau khi đã hiện hết câu hỏi (giống chat). Mỗi hộp, kể cả từng trang, có `consult.consentTimeoutMs` riêng tính từ lúc hộp mở; cả lượt xác nhận bị chặn ở 5 phút. Mỗi trang khoảng 1 000 ký tự / 14 dòng: câu hỏi 3 000 ký tự cần khoảng 5 hộp thoại, 8 000 ký tự khoảng 10. Code nên đi qua `include_files` (hộp xác nhận chỉ liệt kê đường dẫn).
 
-Hết thời gian chờ **không bao giờ** được tính là đồng ý. Selector của OMP tự chọn mục đang được trỏ khi đếm ngược hết, nên AgentBridge trỏ sẵn vào **Từ chối** (Enter theo phản xạ cũng là từ chối) và coi lựa chọn đến sau hạn chót là hết giờ. Điều này áp dụng cho consult, chat và `/agentbridge allow|disallow`.
+Hết thời gian chờ **không bao giờ** được tính là đồng ý. Selector của OMP tự chọn mục đang được trỏ khi đếm ngược hết, nên AgentBridge đặt **Từ chối** ở đầu danh sách và trỏ sẵn vào nó (Enter theo phản xạ cũng là từ chối), và coi lựa chọn đến sau hạn của hộp là hết giờ. Điều này áp dụng cho consult, chat và `/agentbridge allow|disallow`.
 
 Văn bản hiển thị trong hộp xác nhận và văn bản gửi tới OMP là **cùng một chuỗi**: trước khi hiện và gửi, host bỏ escape terminal, ký tự điều khiển và ký tự vô hình (zero-width, bidi, tag Unicode U+E0000–E007F, variation selector…) mà terminal không vẽ nhưng model vẫn đọc được. Câu trả lời trả về Claude cũng được làm sạch như vậy.
 
@@ -251,9 +251,9 @@ Sau khi bật và mở lại OMP (hoặc chờ heartbeat cập nhật record), C
 - Tin được bọc nguồn gửi: `[Tin nhắn từ Claude Code (phiên <id>), chuyển qua AgentBridge — không phải người dùng gõ]` rồi mới tới nội dung.
 - Tin **đi vào transcript OMP** và OMP trả lời trong cùng phiên; OMP có thể dùng tool, sửa file hoặc chạy lệnh theo quyền của chính nó. Đây là khác biệt cốt lõi so với consult. Tin được gửi với `attribution: "agent"` (nguồn là Claude Code, không phải người dùng gõ).
 - **Consent từng tin, xem được toàn văn:** dialog hiển thị `Kích thước: N dòng · M ký tự` của nội dung đã redact/sanitize; nếu phần xem trước bị cắt, ghi thêm `(đã ẩn K ký tự)`.
-  - Tin ngắn (vừa snippet) hiện đủ nội dung với hai lựa chọn **Gửi/Từ chối**.
-  - Tin dài có thêm **Xem toàn văn**. Nội dung đầy đủ được chia trang, mỗi trang có **Trang sau/Từ chối**; chỉ trang cuối mới có **Gửi/Từ chối**. AgentBridge chọn cách **không hiện Gửi trước trang cuối**, nên người dùng buộc phải xem hết nội dung trước khi gửi.
-  - `chat.consentTimeoutMs` là hạn chót chung cho toàn bộ quá trình xem (snippet + mọi trang), không reset theo từng trang. Consent của consult (kể cả `always` hoặc `/agentbridge trust`) **không** áp dụng cho chat. Nếu autochat đang bật và tin nằm trong giới hạn, bước này được bỏ qua; xem mục Autochat.
+  - Tin ngắn (vừa snippet) hiện đủ nội dung với hai lựa chọn **Từ chối/Gửi**.
+  - Tin dài có thêm **Xem toàn văn**. Nội dung đầy đủ được chia trang, mỗi trang có **Từ chối/Trang sau**; chỉ trang cuối mới có **Từ chối/Gửi**. AgentBridge chọn cách **không hiện Gửi trước trang cuối**, nên người dùng buộc phải xem hết nội dung trước khi gửi.
+  - Mỗi hộp (snippet và từng trang) có `chat.consentTimeoutMs` riêng; cả lượt bị chặn ở 5 phút và không vượt quá timeout của tin chat. Consent của consult (kể cả `always` hoặc `/agentbridge trust`) **không** áp dụng cho chat. Nếu autochat đang bật và tin nằm trong giới hạn, bước này được bỏ qua; xem mục Autochat.
 - Nếu OMP đang bận: mặc định trả `busy`; đặt `queueWhenBusy: true` để gửi nối tiếp bằng `followUp` (không bao giờ `steer`).
 - Chỉ một chat chờ trả lời tại một thời điểm; chat thứ hai nhận `busy`.
 - Kết quả trả Claude vẫn là text, có header, dòng **DỮ LIỆU THAM KHẢO** và khung `<<<OMP_REPLY … OMP_REPLY>>>`. Nếu chính câu trả lời có chứa chuỗi `OMP_REPLY`, khung dùng nhãn đánh số mà câu trả lời không chứa (ví dụ `OMP_REPLY_1`) và có một dòng nói rõ nhãn nào kết thúc khung, nên câu trả lời không thể tự "đóng khung" sớm. Tên phiên trong header được đặt trong ngoặc kép kiểu JSON, luôn trên một dòng.

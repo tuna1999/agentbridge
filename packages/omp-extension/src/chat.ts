@@ -18,6 +18,7 @@
 import {
  type ChatBody,
  type ChatResult,
+ CONSENT_TOTAL_MAX_MS,
  type ErrorCode,
  isRecord,
  type ModelRef,
@@ -58,7 +59,8 @@ import {
 
 export const CHAT_SEND_OPTION = CHAT_TEXT.send;
 export const CHAT_DENY_OPTION = CHAT_TEXT.deny;
-export const CHAT_CONSENT_OPTIONS: readonly string[] = [CHAT_SEND_OPTION, CHAT_DENY_OPTION];
+/** The last consent dialog's choices as shown, deny first (01 §7.4b step 8). */
+export const CHAT_CONSENT_OPTIONS: readonly string[] = [CHAT_DENY_OPTION, CHAT_SEND_OPTION];
 export const CHAT_VIEW_FULL_OPTION = CONSENT_TEXT.viewFull;
 export const CHAT_NEXT_PAGE_OPTION = CONSENT_TEXT.nextPage;
 export const CHAT_CONSENT_TITLE = CHAT_TEXT.consentTitle;
@@ -195,7 +197,6 @@ interface PendingChat {
  replyMaxBytes: number;
  timeoutMs: number;
  consentTimeoutMs: number;
- consentDeadline?: number;
  /** "manual" or a source-specific auto consent reason, for the audit line. */
  consent?: string;
  frame?: string;
@@ -533,7 +534,9 @@ export class ChatManager {
 
  /**
   * Snippet dialog, then "Xem toàn văn" pages when the snippet hides anything;
-  * Gửi is only offered on the last page. One deadline covers every dialog.
+  * Gửi is only offered on the last page. Each dialog gets
+  * `chat.consentTimeoutMs`, `CONSENT_TOTAL_MAX_MS` caps the exchange, and the
+  * chat body's timeout bounds every dialog.
   */
  async #selectConsent(
   request: ChatRequest,
@@ -541,15 +544,18 @@ export class ChatManager {
   payload: string,
  ): Promise<string | undefined> {
   const view = buildConsentView(payload);
-  pending.consentDeadline = Date.now() + pending.consentTimeoutMs;
   return runPagedConsent({
    view,
    title: (body, page) => chatConsentTitle(request, body, view.sizeLine, page),
-   finalOptions: CHAT_CONSENT_OPTIONS,
+   approveOptions: [CHAT_SEND_OPTION],
    denyOption: CHAT_DENY_OPTION,
-   beforeDialog: () => this.#assertConsentTime(pending),
-   expired: () => this.#consentExpired(pending),
-   select: (title, options, initialIndex) => this.#selectDialog(request, pending, title, options, initialIndex),
+   dialogTimeoutMs: pending.consentTimeoutMs,
+   totalTimeoutMs: CONSENT_TOTAL_MAX_MS,
+   beforeDialog: () => {
+    if (pending.settled) throw pending.failure ?? new ChatFailure("cancelled", "chat cancelled");
+   },
+   select: (title, options, initialIndex, timeoutMs) =>
+    this.#selectDialog(request, pending, title, options, initialIndex, timeoutMs),
   });
  }
 
@@ -559,10 +565,13 @@ export class ChatManager {
   title: string,
   options: readonly string[],
   initialIndex: number,
+  consentMs: number,
  ): Promise<string | undefined> {
+  const timeout = dialogTimeout(pending, consentMs);
+  const deadline = Date.now() + timeout;
   try {
    return await this.#omp.select(request.ctx, title, [...options], {
-    timeout: dialogTimeout(pending),
+    timeout,
     signal: pending.abort.signal,
     initialIndex,
    });
@@ -572,21 +581,10 @@ export class ChatManager {
    if (request.signal.aborted) {
     throw new ChatFailure("cancelled", "client disconnected during consent");
    }
-   if (this.#consentExpired(pending)) {
+   if (Date.now() >= deadline) {
     throw new ChatFailure("consent_timeout", "chat consent dialog timed out");
    }
    throw new ChatFailure("internal", `ui.select failed: ${redactedError(error)}`);
-  }
- }
-
- #consentExpired(pending: PendingChat): boolean {
-  return pending.consentDeadline !== undefined && Date.now() >= pending.consentDeadline;
- }
-
- #assertConsentTime(pending: PendingChat): void {
-  if (pending.settled) throw pending.failure ?? new ChatFailure("cancelled", "chat cancelled");
-  if (this.#consentExpired(pending)) {
-   throw new ChatFailure("consent_timeout", "chat consent dialog timed out");
   }
  }
 
@@ -688,14 +686,11 @@ export class ChatManager {
 }
 
 /**
- * The chat body owns the overall timeout; `chat.consentTimeoutMs` is a single
- * deadline for the snippet dialog and all full-text pages. The smaller
+ * The chat body owns the overall timeout, so no consent dialog outlives it;
+ * `consentMs` is what the paged consent left for this dialog. The smaller
  * remaining bound wins.
  */
-function dialogTimeout(pending: PendingChat): number {
- const now = Date.now();
- const overall = pending.startedAt + pending.timeoutMs - now;
- const consent =
-  pending.consentDeadline === undefined ? overall : pending.consentDeadline - now;
- return Math.max(1, Math.min(overall, consent));
+function dialogTimeout(pending: PendingChat, consentMs: number): number {
+ const overall = pending.startedAt + pending.timeoutMs - Date.now();
+ return Math.max(1, Math.min(overall, consentMs));
 }

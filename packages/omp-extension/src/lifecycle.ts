@@ -469,9 +469,10 @@ export class Host {
    answer = await this.#omp.select(
     ctx,
     HOST_TEXT.projectConfirmTitle(action, label, project),
-    [HOST_TEXT.agree, HOST_TEXT.refuse],
-    // Highlight "Từ chối": a timeout (adapter → undefined) or a reflexive Enter changes nothing.
-    { timeout: PROJECT_CONFIRM_TIMEOUT_MS, initialIndex: 1 },
+    [HOST_TEXT.refuse, HOST_TEXT.agree],
+    // "Từ chối" first and highlighted: a timeout (adapter → undefined), a host
+    // that auto-picks the first item, or a reflexive Enter changes nothing.
+    { timeout: PROJECT_CONFIRM_TIMEOUT_MS, initialIndex: 0 },
    );
   } catch {
    this.#omp.notify(ctx, HOST_TEXT.confirmUnavailable, "warning");

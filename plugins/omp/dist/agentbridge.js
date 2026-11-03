@@ -88,6 +88,7 @@ var AUTH_FAIL_LIMIT_PER_MIN = 10;
 var LOCKOUT_MS = 30000;
 var CONSULT_CONCURRENCY = 1;
 var DEFAULT_MAX_QUESTION_BYTES = 32768;
+var CONSENT_TOTAL_MAX_MS = 300000;
 var CHAT_TIMEOUT_MAX_MS = 1800000;
 
 // packages/protocol/src/messages.ts
@@ -2364,29 +2365,37 @@ function paginateText(text, maxChars = VIEW_PAGE_CHARS, maxLines = VIEW_PAGE_LIN
   return pages.length > 0 ? pages : [""];
 }
 async function runPagedConsent(options) {
+  const now = options.now ?? (() => Date.now());
+  const dialogMs = Math.max(1, options.dialogTimeoutMs);
+  const totalDeadline = now() + Math.max(dialogMs, options.totalTimeoutMs);
+  const approvals = options.approveOptions.filter((label) => label !== options.denyOption);
+  const ask = async (body, page, labels) => {
+    options.beforeDialog?.();
+    const opened = now();
+    const deadline = Math.min(opened + dialogMs, totalDeadline);
+    if (opened >= deadline)
+      return;
+    const offered = [options.denyOption, ...labels];
+    const choice = await options.select(options.title(body, page), offered, 0, deadline - opened);
+    return choice !== undefined && now() >= deadline ? undefined : choice;
+  };
   const finalChoice = (choice) => {
     if (choice === undefined)
       return;
-    return options.finalOptions.includes(choice) ? choice : options.denyOption;
+    return approvals.includes(choice) ? choice : options.denyOption;
   };
-  const ask = async (title, labels) => {
-    const choice = await options.select(title, labels, Math.max(0, labels.indexOf(options.denyOption)));
-    return choice !== undefined && options.expired?.() === true ? undefined : choice;
-  };
-  options.beforeDialog?.();
   if (!options.view.truncated) {
-    return finalChoice(await ask(options.title(options.view.snippet), [...options.finalOptions]));
+    return finalChoice(await ask(options.view.snippet, undefined, approvals));
   }
-  const initial = await ask(options.title(options.view.snippet), [CONSENT_TEXT.viewFull, options.denyOption]);
+  const initial = await ask(options.view.snippet, undefined, [CONSENT_TEXT.viewFull]);
   if (initial === undefined)
     return;
   if (initial !== CONSENT_TEXT.viewFull)
     return options.denyOption;
   const pages = paginateText(options.view.full);
   for (let index = 0;index < pages.length; index += 1) {
-    options.beforeDialog?.();
     const last = index === pages.length - 1;
-    const choice = await ask(options.title(pages[index] ?? "", { index: index + 1, total: pages.length }), last ? [...options.finalOptions] : [CONSENT_TEXT.nextPage, options.denyOption]);
+    const choice = await ask(pages[index] ?? "", { index: index + 1, total: pages.length }, last ? approvals : [CONSENT_TEXT.nextPage]);
     if (choice === undefined)
       return;
     if (last)
@@ -2448,11 +2457,8 @@ function buildPrompt(question, attachments, callerSessionId) {
 }
 
 // packages/omp-extension/src/consult.ts
-var CONSENT_OPTIONS = [
-  CONSULT_TEXT.allowOnce,
-  CONSULT_TEXT.allowSession,
-  CONSULT_TEXT.deny
-];
+var CONSENT_APPROVE_OPTIONS = [CONSULT_TEXT.allowOnce, CONSULT_TEXT.allowSession];
+var CONSENT_OPTIONS = [CONSULT_TEXT.deny, ...CONSENT_APPROVE_OPTIONS];
 var CONSENT_TITLE = CONSULT_TEXT.consentTitle;
 var CONSENT_SESSION_CHARS = 128;
 var CONSENT_MAX_ATTACHMENTS = 10;
@@ -2850,14 +2856,11 @@ class ConsultManager {
           if (choice === undefined) {
             throw new ConsultFailure("consent_timeout", "consent dialog timed out");
           }
-          if (choice === CONSENT_OPTIONS[2]) {
+          if (choice !== CONSULT_TEXT.allowOnce && choice !== CONSULT_TEXT.allowSession) {
             throw new ConsultFailure("denied", "user declined the consult", "denied");
           }
-          if (choice === CONSENT_OPTIONS[1])
+          if (choice === CONSULT_TEXT.allowSession)
             request.trustSession();
-          if (choice !== CONSENT_OPTIONS[0] && choice !== CONSENT_OPTIONS[1]) {
-            throw new ConsultFailure("denied", "user declined the consult", "denied");
-          }
         }
         if (request.signal.aborted) {
           throw new ConsultFailure("cancelled", "client disconnected before the turn");
@@ -3040,20 +3043,16 @@ class ConsultManager {
   }
   async#selectConsent(request, config, payload) {
     const view = buildConsentView(payload.question);
-    const deadline = Date.now() + config.consult.consentTimeoutMs;
     return runPagedConsent({
       view,
       title: (body, page) => consentTitle(request, payload.attachments, view.sizeLine, body, page),
-      finalOptions: CONSENT_OPTIONS,
+      approveOptions: CONSENT_APPROVE_OPTIONS,
       denyOption: CONSULT_TEXT.deny,
-      beforeDialog: () => {
-        if (Date.now() >= deadline)
-          throw new ConsultFailure("consent_timeout", "consent dialog timed out");
-      },
-      expired: () => Date.now() >= deadline,
-      select: async (title, options, initialIndex) => {
+      dialogTimeoutMs: config.consult.consentTimeoutMs,
+      totalTimeoutMs: CONSENT_TOTAL_MAX_MS,
+      select: async (title, options, initialIndex, timeoutMs) => {
         const dialogOptions = {
-          timeout: Math.max(1, deadline - Date.now()),
+          timeout: timeoutMs,
           signal: request.signal,
           initialIndex
         };
@@ -3101,7 +3100,7 @@ class ConsultManager {
 // packages/omp-extension/src/chat.ts
 var CHAT_SEND_OPTION = CHAT_TEXT.send;
 var CHAT_DENY_OPTION = CHAT_TEXT.deny;
-var CHAT_CONSENT_OPTIONS = [CHAT_SEND_OPTION, CHAT_DENY_OPTION];
+var CHAT_CONSENT_OPTIONS = [CHAT_DENY_OPTION, CHAT_SEND_OPTION];
 var CHAT_VIEW_FULL_OPTION = CONSENT_TEXT.viewFull;
 var CHAT_NEXT_PAGE_OPTION = CONSENT_TEXT.nextPage;
 var CHAT_CONSENT_TITLE = CHAT_TEXT.consentTitle;
@@ -3469,21 +3468,26 @@ class ChatManager {
   }
   async#selectConsent(request, pending, payload) {
     const view = buildConsentView(payload);
-    pending.consentDeadline = Date.now() + pending.consentTimeoutMs;
     return runPagedConsent({
       view,
       title: (body, page) => chatConsentTitle(request, body, view.sizeLine, page),
-      finalOptions: CHAT_CONSENT_OPTIONS,
+      approveOptions: [CHAT_SEND_OPTION],
       denyOption: CHAT_DENY_OPTION,
-      beforeDialog: () => this.#assertConsentTime(pending),
-      expired: () => this.#consentExpired(pending),
-      select: (title, options, initialIndex) => this.#selectDialog(request, pending, title, options, initialIndex)
+      dialogTimeoutMs: pending.consentTimeoutMs,
+      totalTimeoutMs: CONSENT_TOTAL_MAX_MS,
+      beforeDialog: () => {
+        if (pending.settled)
+          throw pending.failure ?? new ChatFailure("cancelled", "chat cancelled");
+      },
+      select: (title, options, initialIndex, timeoutMs) => this.#selectDialog(request, pending, title, options, initialIndex, timeoutMs)
     });
   }
-  async#selectDialog(request, pending, title, options, initialIndex) {
+  async#selectDialog(request, pending, title, options, initialIndex, consentMs) {
+    const timeout = dialogTimeout(pending, consentMs);
+    const deadline = Date.now() + timeout;
     try {
       return await this.#omp.select(request.ctx, title, [...options], {
-        timeout: dialogTimeout(pending),
+        timeout,
         signal: pending.abort.signal,
         initialIndex
       });
@@ -3495,20 +3499,10 @@ class ChatManager {
       if (request.signal.aborted) {
         throw new ChatFailure("cancelled", "client disconnected during consent");
       }
-      if (this.#consentExpired(pending)) {
+      if (Date.now() >= deadline) {
         throw new ChatFailure("consent_timeout", "chat consent dialog timed out");
       }
       throw new ChatFailure("internal", `ui.select failed: ${redactedError(error)}`);
-    }
-  }
-  #consentExpired(pending) {
-    return pending.consentDeadline !== undefined && Date.now() >= pending.consentDeadline;
-  }
-  #assertConsentTime(pending) {
-    if (pending.settled)
-      throw pending.failure ?? new ChatFailure("cancelled", "chat cancelled");
-    if (this.#consentExpired(pending)) {
-      throw new ChatFailure("consent_timeout", "chat consent dialog timed out");
     }
   }
   #progress(request, body) {
@@ -3592,11 +3586,9 @@ class ChatManager {
     }
   }
 }
-function dialogTimeout(pending) {
-  const now = Date.now();
-  const overall = pending.startedAt + pending.timeoutMs - now;
-  const consent = pending.consentDeadline === undefined ? overall : pending.consentDeadline - now;
-  return Math.max(1, Math.min(overall, consent));
+function dialogTimeout(pending, consentMs) {
+  const overall = pending.startedAt + pending.timeoutMs - Date.now();
+  return Math.max(1, Math.min(overall, consentMs));
 }
 
 // packages/omp-extension/src/project-config.ts
@@ -4039,7 +4031,7 @@ class Host {
     const label = HOST_TEXT.projectActionLabel(action);
     let answer;
     try {
-      answer = await this.#omp.select(ctx, HOST_TEXT.projectConfirmTitle(action, label, project), [HOST_TEXT.agree, HOST_TEXT.refuse], { timeout: PROJECT_CONFIRM_TIMEOUT_MS, initialIndex: 1 });
+      answer = await this.#omp.select(ctx, HOST_TEXT.projectConfirmTitle(action, label, project), [HOST_TEXT.refuse, HOST_TEXT.agree], { timeout: PROJECT_CONFIRM_TIMEOUT_MS, initialIndex: 0 });
     } catch {
       this.#omp.notify(ctx, HOST_TEXT.confirmUnavailable, "warning");
       return false;
