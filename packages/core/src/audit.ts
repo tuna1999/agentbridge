@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { appendFile, chmod, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { type ErrorCode, type PeerAgent, redact, type Usage } from "@agentbridge/protocol";
+import { type ErrorCode, type PeerAgent, redact, sanitizeText, type Usage } from "@agentbridge/protocol";
 import { ensureSecureDir } from "./dirs";
 
 export type AuditEventName = "consult" | "chat" | "status" | "auth_fail" | "denied" | "error";
@@ -51,8 +51,8 @@ export async function appendAudit(event: AuditEvent, options: AuditOptions): Pro
 	record.outcome = event.outcome;
 	if (event.consent !== undefined) record.consent = event.consent;
 	if (options.content) {
-		if (event.question !== undefined) record.question = redact(event.question).text;
-		if (event.reply !== undefined) record.reply = redact(event.reply).text;
+		if (event.question !== undefined) record.question = redact(sanitizeText(event.question)).text;
+		if (event.reply !== undefined) record.reply = redact(sanitizeText(event.reply)).text;
 	}
 
 	const line = `${JSON.stringify(record)}\n`;

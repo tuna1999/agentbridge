@@ -122,6 +122,48 @@ test("lists valid records and ignores partial, corrupt, and symlinked files", as
 	expect(records).toEqual([rec]);
 });
 
+test("debug diagnostics for skipped files never touch stdout", async () => {
+	const rec = makeRecord();
+	await writeRecord(rec, "token");
+	writeFileSync(join(sessionsDir(), "omp-bad.json"), "{");
+
+	const savedDebug = process.env.AGENTBRIDGE_DEBUG;
+	const originalStdout = process.stdout.write.bind(process.stdout);
+	const originalStderr = process.stderr.write.bind(process.stderr);
+	const stdout: string[] = [];
+	const stderr: string[] = [];
+	process.env.AGENTBRIDGE_DEBUG = "1";
+	process.stdout.write = ((chunk: string | Uint8Array) => {
+		stdout.push(String(chunk));
+		return true;
+	}) as typeof process.stdout.write;
+	process.stderr.write = ((chunk: string | Uint8Array) => {
+		stderr.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
+	try {
+		expect(await listRecords()).toEqual([rec]);
+	} finally {
+		process.stdout.write = originalStdout;
+		process.stderr.write = originalStderr;
+		if (savedDebug === undefined) delete process.env.AGENTBRIDGE_DEBUG;
+		else process.env.AGENTBRIDGE_DEBUG = savedDebug;
+	}
+	expect(stdout.join("")).toBe("");
+	expect(stderr.join("")).toContain("omp-bad.json");
+});
+
+test("skips a record whose sessionName is not a reasonable string", async () => {
+	const good = makeRecord({ sessionName: "review" });
+	await writeRecord(good, "token");
+	const badType = makeRecord({ sessionId: "01a18dd3-7bdd-71ef-9ea9-000000000001", instanceId: "i-2" });
+	writeFileSync(recordFile(badType), JSON.stringify({ ...badType, sessionName: { evil: true } }));
+	const tooLong = makeRecord({ sessionId: "01a18dd3-7bdd-71ef-9ea9-000000000002", instanceId: "i-3" });
+	writeFileSync(recordFile(tooLong), JSON.stringify({ ...tooLong, sessionName: "x".repeat(10_000) }));
+
+	expect(await listRecords()).toEqual([good]);
+});
+
 test("returns no records when sessions is missing", async () => {
 	rmSync(sessionsDir(), { recursive: true, force: true });
 	expect(await listRecords()).toEqual([]);

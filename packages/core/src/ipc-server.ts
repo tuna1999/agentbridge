@@ -15,6 +15,7 @@ import {
 	isRetryable,
 	LineReader,
 	LOCKOUT_MS,
+	MAX_FRAME_BYTES,
 	newId,
 	parseEnvelope,
 	PROTOCOL_VERSION,
@@ -238,7 +239,7 @@ async function listen(server: Server, path: string): Promise<void> {
 		return;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-		// Only steal the path when nothing is listening on it (01 T4).
+		// Only steal the path when nothing is listening on it (02-tasks T4).
 		if (await canConnect(path)) throw error;
 		await rm(path, { force: true });
 		await listenOnce(server, path);
@@ -465,7 +466,10 @@ export async function startServer(opts: StartServerOptions): Promise<ServerHandl
 						clearTimeout(requestTimer);
 						requestTimer = undefined;
 					}
-					const parsed = parseEnvelope(line);
+					// The frame cap already bounds the body; the configured
+					// `consult.maxQuestionBytes` is enforced by the request handler, so the
+					// transport must not impose the 32 KiB default on top of it.
+					const parsed = parseEnvelope(line, { maxQuestionBytes: MAX_FRAME_BYTES });
 					if (parsed instanceof ProtocolError) {
 						fail(parsed.code, parsed.message, extractId(line));
 						return;

@@ -327,6 +327,28 @@ test("accepts the right token and serves a status request", async () => {
 	expect(response.result).toEqual(statusBody());
 });
 
+test("leaves the question size policy to the handler instead of the 32 KiB default", async () => {
+	const seen: number[] = [];
+	await start({
+		onRequest: async (env, io) => {
+			const body = env.body as { question?: string };
+			seen.push(Buffer.byteLength(body.question ?? "", "utf8"));
+			io.send(resultFrame(env, { replyText: "ok", truncated: false, model: { provider: "p", id: "m" }, durationMs: 1, capped: false }));
+		},
+	});
+	const response = await request({
+		endpoint: endpoint(),
+		token: TOKEN,
+		from: CALLER,
+		to: TARGET,
+		type: "consult",
+		body: { question: "q".repeat(40_000) },
+		timeoutMs: 2_000,
+	});
+	expect(seen).toEqual([40_000]);
+	expect((response.result as { replyText: string }).replyText).toBe("ok");
+});
+
 test("handles hello and request written in one chunk", async () => {
 	await start();
 	const raw = await RawClient.connect(socketFile());

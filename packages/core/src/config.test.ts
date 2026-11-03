@@ -247,6 +247,24 @@ test("uses AGENTBRIDGE_CONFIG for the default path", async () => {
 	expect((await loadConfig()).projects).toEqual([realpathSync(project)]);
 });
 
+test("drops relative project entries instead of resolving them against the process cwd", async () => {
+	const project = join(dir, "abs-project");
+	mkdirSync(project);
+	writeConfig({ projects: [".", "relative/dir", project] });
+
+	const originalWarn = console.warn;
+	const warnings: string[] = [];
+	console.warn = (message: string) => {
+		warnings.push(message);
+	};
+	try {
+		expect((await loadConfig()).projects).toEqual([realpathSync(project)]);
+	} finally {
+		console.warn = originalWarn;
+	}
+	expect(warnings.length).toBe(2);
+});
+
 test("realpaths projects, drops missing ones, and warns once", async () => {
 	const project = join(dir, "project");
 	mkdirSync(project);

@@ -1,5 +1,6 @@
 /** Config parsing, defaults, and mtime cache. Spec: 01 §6. */
 import { readFile, realpath, stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import { type ConsentPolicy, isRecord, type PeerAgent } from "@agentbridge/protocol";
 import { resolveDirs } from "./dirs";
 import { CORE_MESSAGES } from "./messages";
@@ -271,18 +272,28 @@ interface CacheEntry {
 let cache: CacheEntry | undefined;
 const warned = new Set<string>();
 
-/** Resolve each project to its real path; silently drop and warn once for missing ones. */
+function warnOnce(key: string, message: string): void {
+	if (warned.has(key)) return;
+	warned.add(key);
+	console.warn(message);
+}
+
+/**
+ * Resolve each project to its real path; drop and warn once for missing ones.
+ * Relative entries are dropped too: they would resolve against whatever
+ * directory the OMP process started in, so `"."` would allow every project.
+ */
 async function resolveProjects(projects: string[], configPath: string): Promise<string[]> {
 	const resolved: string[] = [];
 	for (const project of projects) {
+		if (!isAbsolute(project)) {
+			warnOnce(`relative:${configPath}:${project}`, CORE_MESSAGES.relativeProject(project));
+			continue;
+		}
 		try {
 			resolved.push(await realpath(project));
 		} catch {
-			const key = `project:${configPath}:${project}`;
-			if (!warned.has(key)) {
-				warned.add(key);
-				console.warn(CORE_MESSAGES.missingProject(project));
-			}
+			warnOnce(`project:${configPath}:${project}`, CORE_MESSAGES.missingProject(project));
 		}
 	}
 	return resolved;
@@ -317,11 +328,7 @@ export async function loadConfig(
 		config.projects = await resolveProjects(config.projects, path);
 	} catch {
 		config = defaultConfig();
-		const key = `invalid:${path}:${mtimeMs}`;
-		if (!warned.has(key)) {
-			warned.add(key);
-			console.warn(CORE_MESSAGES.invalidConfig(path));
-		}
+		warnOnce(`invalid:${path}:${mtimeMs}`, CORE_MESSAGES.invalidConfig(path));
 	}
 
 	cache = { path, mtimeMs, config };

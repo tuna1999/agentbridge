@@ -78,6 +78,8 @@ function tokenPath(dirs: Dirs, tokenFile: string): string {
 }
 
 const RECORD_CAPABILITIES = ["status", "consult", "chat", "delegate"] as const;
+/** Generous bound for an OMP session name; longer values mark the record invalid. */
+const MAX_SESSION_NAME_CHARS = 512;
 
 function isRecordCapability(value: unknown): boolean {
 	return typeof value === "string" && (RECORD_CAPABILITIES as readonly string[]).includes(value);
@@ -91,6 +93,10 @@ function isSessionRecord(value: unknown): value is SessionRecord {
 	if (typeof value.tokenFile !== "string" || !safeName(value.tokenFile)) return false;
 	if (typeof value.endpoint !== "string" || value.endpoint.length === 0) return false;
 	if (typeof value.cwd !== "string" || value.cwd.length === 0) return false;
+	// Shown to Claude in result headers; formatters still sanitize it.
+	if (value.sessionName !== undefined && (typeof value.sessionName !== "string" || value.sessionName.length > MAX_SESSION_NAME_CHARS)) {
+		return false;
+	}
 	if (typeof value.agentVersion !== "string" || typeof value.extensionVersion !== "string") return false;
 	if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0) return false;
 	if (typeof value.procStart !== "string") return false;
@@ -101,8 +107,17 @@ function isSessionRecord(value: unknown): value is SessionRecord {
 	return true;
 }
 
+/**
+ * Opt-in diagnostics. Always stderr: `console.debug` writes to stdout in Bun,
+ * and stdout belongs to MCP framing in the stdio server (and to `ab --json`).
+ */
 function debugSkip(file: string, reason: string): void {
-	if (process.env.AGENTBRIDGE_DEBUG === "1") console.debug(`[agentbridge] skip ${file}: ${reason}`);
+	if (process.env.AGENTBRIDGE_DEBUG !== "1") return;
+	try {
+		process.stderr.write(`[agentbridge] skip ${file}: ${reason}\n`);
+	} catch {
+		// diagnostics are best-effort
+	}
 }
 
 /** Write token first (0600), then the record (0600). */
