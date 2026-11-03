@@ -14,7 +14,7 @@ var package_default = {
 
 // packages/omp-extension/src/autochat.ts
 import { realpath as realpath3, stat as stat4 } from "fs/promises";
-import { isAbsolute as isAbsolute2, relative, sep } from "path";
+import { isAbsolute as isAbsolute3, relative, sep } from "path";
 
 // packages/core/src/audit.ts
 import { createHash } from "crypto";
@@ -137,7 +137,8 @@ function newId() {
   return Bun.randomUUIDv7();
 }
 // packages/protocol/src/redact.ts
-var PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
+var PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
+var PRIVATE_KEY_END = /-----END [A-Z ]*PRIVATE KEY-----/g;
 var SECRET_ASSIGNMENT = /(password|passwd|secret|token|api[_-]?key|access[_-]?key)['"]?\s*[:=]\s*['"]?((?!\[REDACTED:)[^\s'"]{8,})/gi;
 var GITHUB_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,})/g;
 var AWS_ACCESS_KEY = /\bAKIA[0-9A-Z]{16}\b/g;
@@ -156,13 +157,32 @@ var TOKEN_RULES = [
 function placeholder(kind) {
   return `[REDACTED:${kind}]`;
 }
+function redactPrivateKeys(input) {
+  let output = "";
+  let cursor = 0;
+  let hits = 0;
+  PRIVATE_KEY_BEGIN.lastIndex = 0;
+  for (;; ) {
+    const begin = PRIVATE_KEY_BEGIN.exec(input);
+    if (begin === null)
+      break;
+    PRIVATE_KEY_END.lastIndex = begin.index + begin[0].length;
+    const end = PRIVATE_KEY_END.exec(input);
+    if (end === null)
+      break;
+    output += `${input.slice(cursor, begin.index)}${placeholder("private_key")}`;
+    hits += 1;
+    cursor = end.index + end[0].length;
+    PRIVATE_KEY_BEGIN.lastIndex = cursor;
+  }
+  return { text: output + input.slice(cursor), hits };
+}
 function redact(input) {
   let text = input;
   let hits = 0;
-  text = text.replace(PRIVATE_KEY, () => {
-    hits += 1;
-    return placeholder("private_key");
-  });
+  const keys = redactPrivateKeys(text);
+  text = keys.text;
+  hits += keys.hits;
   text = text.replace(SECRET_ASSIGNMENT, (match, _name, value) => {
     hits += 1;
     return `${match.slice(0, match.length - value.length)}${placeholder("secret")}`;
@@ -174,6 +194,20 @@ function redact(input) {
     });
   }
   return { text, hits };
+}
+// packages/protocol/src/sanitize.ts
+var ANSI_ESCAPE_SEQUENCES = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\)|[@-_])|\u009b[0-?]*[ -/]*[@-~]/g;
+var CONTROL_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+var INVISIBLE_CHARS = /[\p{Cf}\u{034f}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{fe00}-\u{fe0f}\u{e0100}-\u{e01ef}]/gu;
+var LINE_SEPARATORS = /[\u{2028}\u{2029}]/gu;
+function sanitizeText(text) {
+  return text.replace(ANSI_ESCAPE_SEQUENCES, "").replace(/\r\n?/g, `
+`).replace(CONTROL_CHARS, "").replace(INVISIBLE_CHARS, "").replace(LINE_SEPARATORS, `
+`);
+}
+function sanitizeLabel(text, maxChars = 160) {
+  const clean = sanitizeText(text).replace(/\s+/g, " ").trim();
+  return clean.length > maxChars ? `${clean.slice(0, maxChars - 1)}\u2026` : clean;
 }
 // packages/protocol/src/validate.ts
 var MSG_TYPES = ["hello", "status", "consult", "chat", "progress", "result", "error"];
@@ -537,6 +571,7 @@ var CORE_MESSAGES = {
   insecureDir: (path) => `Th\u01B0 m\u1EE5c kh\xF4ng an to\xE0n (c\u1EA7n 0700 v\xE0 thu\u1ED9c user hi\u1EC7n t\u1EA1i): ${path}`,
   invalidConfig: (path) => `Config kh\xF4ng h\u1EE3p l\u1EC7, d\xF9ng m\u1EB7c \u0111\u1ECBnh an to\xE0n: ${path}`,
   missingProject: (path) => `B\u1ECF qua project kh\xF4ng t\u1ED3n t\u1EA1i: ${path}`,
+  relativeProject: (path) => `B\u1ECF qua project kh\xF4ng ph\u1EA3i \u0111\u01B0\u1EDDng d\u1EABn tuy\u1EC7t \u0111\u1ED1i: ${path}`,
   socketPathTooLong: (path, bytes, maxBytes) => `\u0110\u01B0\u1EDDng d\u1EABn socket qu\xE1 d\xE0i (${bytes} byte, t\u1ED1i \u0111a ${maxBytes}): ${path}. H\xE3y \u0111\u1EB7t AGENTBRIDGE_RUNTIME_DIR ng\u1EAFn h\u01A1n.`
 };
 
@@ -649,9 +684,9 @@ async function appendAudit(event, options) {
     record.consent = event.consent;
   if (options.content) {
     if (event.question !== undefined)
-      record.question = redact(event.question).text;
+      record.question = redact(sanitizeText(event.question)).text;
     if (event.reply !== undefined)
-      record.reply = redact(event.reply).text;
+      record.reply = redact(sanitizeText(event.reply)).text;
   }
   const line = `${JSON.stringify(record)}
 `;
@@ -675,6 +710,7 @@ async function appendAudit(event, options) {
 }
 // packages/core/src/config.ts
 import { readFile, realpath, stat as stat2 } from "fs/promises";
+import { isAbsolute } from "path";
 var AUTO_MAX_CHARS_DEFAULT = 2000;
 var AUTO_MAX_MESSAGES_DEFAULT = 20;
 var AUTO_MIN_INTERVAL_MS_DEFAULT = 1e4;
@@ -879,17 +915,23 @@ function parseConfig(value) {
 }
 var cache;
 var warned = new Set;
+function warnOnce(key, message) {
+  if (warned.has(key))
+    return;
+  warned.add(key);
+  console.warn(message);
+}
 async function resolveProjects(projects, configPath) {
   const resolved = [];
   for (const project of projects) {
+    if (!isAbsolute(project)) {
+      warnOnce(`relative:${configPath}:${project}`, CORE_MESSAGES.relativeProject(project));
+      continue;
+    }
     try {
       resolved.push(await realpath(project));
     } catch {
-      const key = `project:${configPath}:${project}`;
-      if (!warned.has(key)) {
-        warned.add(key);
-        console.warn(CORE_MESSAGES.missingProject(project));
-      }
+      warnOnce(`project:${configPath}:${project}`, CORE_MESSAGES.missingProject(project));
     }
   }
   return resolved;
@@ -912,11 +954,7 @@ async function loadConfig(configPath, options = {}) {
     config.projects = await resolveProjects(config.projects, path);
   } catch {
     config = defaultConfig();
-    const key = `invalid:${path}:${mtimeMs}`;
-    if (!warned.has(key)) {
-      warned.add(key);
-      console.warn(CORE_MESSAGES.invalidConfig(path));
-    }
+    warnOnce(`invalid:${path}:${mtimeMs}`, CORE_MESSAGES.invalidConfig(path));
   }
   cache = { path, mtimeMs, config };
   return config;
@@ -947,7 +985,7 @@ async function readConfigStrict(configPath) {
 }
 // packages/core/src/git.ts
 import { realpath as realpath2 } from "fs/promises";
-import { isAbsolute, resolve } from "path";
+import { isAbsolute as isAbsolute2, resolve } from "path";
 var GIT_TIMEOUT_MS = 2000;
 function spawnGit(dir) {
   try {
@@ -986,7 +1024,7 @@ async function gitInfo(dir) {
     return;
   try {
     const worktree = await realpath2(worktreeRaw);
-    const commonDir = await realpath2(isAbsolute(commonRaw) ? commonRaw : resolve(dir, commonRaw));
+    const commonDir = await realpath2(isAbsolute2(commonRaw) ? commonRaw : resolve(dir, commonRaw));
     const info = { worktree, commonDir };
     if (branch !== undefined && branch.length > 0)
       info.branch = branch;
@@ -1388,7 +1426,7 @@ async function startServer(opts) {
             clearTimeout(requestTimer);
             requestTimer = undefined;
           }
-          const parsed = parseEnvelope(line);
+          const parsed = parseEnvelope(line, { maxQuestionBytes: MAX_FRAME_BYTES });
           if (parsed instanceof ProtocolError) {
             fail(parsed.code, parsed.message, extractId(line));
             return;
@@ -1573,6 +1611,7 @@ function tokenPath(dirs, tokenFile) {
   return join3(dirs.sessionsDir, tokenFile);
 }
 var RECORD_CAPABILITIES = ["status", "consult", "chat", "delegate"];
+var MAX_SESSION_NAME_CHARS = 512;
 function isRecordCapability(value) {
   return typeof value === "string" && RECORD_CAPABILITIES.includes(value);
 }
@@ -1591,6 +1630,9 @@ function isSessionRecord(value) {
     return false;
   if (typeof value.cwd !== "string" || value.cwd.length === 0)
     return false;
+  if (value.sessionName !== undefined && (typeof value.sessionName !== "string" || value.sessionName.length > MAX_SESSION_NAME_CHARS)) {
+    return false;
+  }
   if (typeof value.agentVersion !== "string" || typeof value.extensionVersion !== "string")
     return false;
   if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0)
@@ -1608,8 +1650,12 @@ function isSessionRecord(value) {
   return true;
 }
 function debugSkip(file, reason) {
-  if (process.env.AGENTBRIDGE_DEBUG === "1")
-    console.debug(`[agentbridge] skip ${file}: ${reason}`);
+  if (process.env.AGENTBRIDGE_DEBUG !== "1")
+    return;
+  try {
+    process.stderr.write(`[agentbridge] skip ${file}: ${reason}
+`);
+  } catch {}
 }
 async function writeRecord(rec, token) {
   if (rec.schema !== "agentbridge.session/1" || rec.agent !== "omp")
@@ -1754,9 +1800,135 @@ async function sweepStale(options = {}) {
   }
   return removed;
 }
+// packages/omp-extension/src/messages.ts
+var CONSENT_TEXT = {
+  viewFull: "Xem to\xE0n v\u0103n",
+  nextPage: "Trang sau",
+  page: (index, total) => `Trang ${index}/${total}`,
+  size: (lines, chars, hidden) => `K\xEDch th\u01B0\u1EDBc: ${lines} d\xF2ng \xB7 ${chars} k\xFD t\u1EF1${hidden > 0 ? ` (\u0111\xE3 \u1EA9n ${hidden} k\xFD t\u1EF1)` : ""}`
+};
+var CONSULT_TEXT = {
+  consentTitle: "AgentBridge: Claude Code mu\u1ED1n h\u1ECFi \xFD ki\u1EBFn",
+  allowOnce: "Cho ph\xE9p l\u1EA7n n\xE0y",
+  allowSession: "Cho ph\xE9p trong phi\xEAn n\xE0y",
+  deny: "T\u1EEB ch\u1ED1i",
+  attachmentsLine: (count, callerSession) => `\u0110\xEDnh k\xE8m: ${count} \xB7 caller session: ${callerSession}`,
+  attachmentItem: (location) => `  \u2022 ${location}`,
+  moreAttachments: (count) => `  \u2026 v\xE0 ${count} t\u1EC7p kh\xE1c`,
+  answered: (durationMs) => `AgentBridge: \u0111\xE3 tr\u1EA3 l\u1EDDi Claude (${durationMs}ms)`,
+  widgetHeader: (caller) => `\u25C6 AgentBridge \xB7 Claude \u0111ang h\u1ECFi \xB7 ${caller}`,
+  widgetDone: (durationMs) => `\u2713 \u0111\xE3 tr\u1EA3 l\u1EDDi Claude (${durationMs}ms)`,
+  widgetFailed: (code) => `\u2717 ${code}`
+};
+var CHAT_TEXT = {
+  consentTitle: "AgentBridge: Claude Code mu\u1ED1n g\u1EEDi tin v\xE0o phi\xEAn OMP",
+  send: "G\u1EEDi",
+  deny: "T\u1EEB ch\u1ED1i",
+  caller: (agent, sessionId) => `${agent} \xB7 phi\xEAn ${sessionId}`,
+  callerLine: (caller) => `Caller: ${caller}`,
+  transcriptWarning: "Tin n\xE0y s\u1EBD hi\u1EC7n trong transcript OMP; OMP c\xF3 th\u1EC3 ch\u1EA1y tool theo quy\u1EC1n c\u1EE7a ch\xEDnh n\xF3.",
+  frame: (caller, message) => `[Tin nh\u1EAFn t\u1EEB Claude Code (phi\xEAn ${caller}), chuy\u1EC3n qua AgentBridge \u2014 kh\xF4ng ph\u1EA3i ng\u01B0\u1EDDi d\xF9ng g\xF5]
+
+${message}`
+};
+var HOST_TEXT = {
+  mainTuiOnly: (command) => `AgentBridge: /agentbridge ${command} ch\u1EC9 d\xF9ng trong TUI ch\xEDnh; kh\xF4ng thay \u0111\u1ED5i config.`,
+  projectActionLabel: (action) => action === "allow" ? "Cho ph\xE9p" : "B\u1ECF cho ph\xE9p",
+  projectConfirmTitle: (action, label, project) => `AgentBridge: /agentbridge ${action} \u2014 ${label} project?
+${project}`,
+  agree: "\u0110\u1ED3ng \xFD",
+  refuse: "T\u1EEB ch\u1ED1i",
+  confirmUnavailable: "AgentBridge: kh\xF4ng m\u1EDF \u0111\u01B0\u1EE3c h\u1ED9p tho\u1EA1i x\xE1c nh\u1EADn; config kh\xF4ng thay \u0111\u1ED5i.",
+  confirmCancelled: "AgentBridge: \u0111\xE3 hu\u1EF7; config kh\xF4ng thay \u0111\u1ED5i.",
+  configWriteFailed: (path, reason) => `AgentBridge: kh\xF4ng ghi \u0111\u01B0\u1EE3c config (${path}): ${reason.slice(0, 200)}`,
+  configReadFailed: (path, reason) => `AgentBridge: kh\xF4ng \u0111\u1ECDc \u0111\u01B0\u1EE3c config (${path}): ${reason.slice(0, 200)}`,
+  projectAllowed: (project) => `AgentBridge: \u0111\xE3 cho ph\xE9p project: ${project}`,
+  projectDisallowed: (project) => `AgentBridge: \u0111\xE3 b\u1ECF cho ph\xE9p project: ${project}`,
+  projectAlreadyListed: (project) => `AgentBridge: project \u0111\xE3 c\xF3 trong danh s\xE1ch: ${project}`,
+  projectNotListed: (project) => `AgentBridge: project kh\xF4ng c\xF3 trong danh s\xE1ch: ${project}`,
+  configInvalidNoWrite: (path, reason) => `AgentBridge: config kh\xF4ng h\u1EE3p l\u1EC7: ${path} (${reason}); kh\xF4ng ghi \u0111\xE8.`,
+  configInsecureNoWrite: (path, reason) => `AgentBridge: config kh\xF4ng an to\xE0n: ${path} (${reason}); kh\xF4ng ghi.`,
+  configInsecure: (path, reason) => `AgentBridge: config kh\xF4ng an to\xE0n: ${path} (${reason})`,
+  configInsideProject: (project) => `AgentBridge: t\u1EEB ch\u1ED1i ghi config v\xEC file n\u1EB1m trong project \u0111\u01B0\u1EE3c ph\xE9p (${project}); h\xE3y chuy\u1EC3n config ra ngo\xE0i project.`,
+  configMissingHeader: (path) => `AgentBridge: config ch\u01B0a c\xF3 (d\xF9ng m\u1EB7c \u0111\u1ECBnh an to\xE0n): ${path}`,
+  configHeader: (path) => `AgentBridge: config: ${path}`,
+  projectsLine: (projects) => `projects: ${projects.length === 0 ? "(tr\u1ED1ng)" : projects.join(", ")}`,
+  trusted: "AgentBridge: \u0111\xE3 tin phi\xEAn n\xE0y (ch\u1EC9 trong b\u1ED9 nh\u1EDB).",
+  untrusted: "AgentBridge: \u0111\xE3 b\u1ECF tin c\u1EADy phi\xEAn n\xE0y.",
+  serverOff: "AgentBridge: \u0111\xE3 t\u1EAFt server cho phi\xEAn n\xE0y.",
+  serverOn: "AgentBridge: \u0111\xE3 b\u1EADt l\u1EA1i server cho phi\xEAn n\xE0y.",
+  autochatState: (mode, source) => `AgentBridge: autochat ${mode} (${source}). D\xF9ng /agentbridge autochat off|limited [ph\xFAt]|unlimited.`,
+  autochatUsage: "AgentBridge: d\xF9ng /agentbridge autochat off|limited [ph\xFAt]|unlimited.",
+  autochatOff: "AgentBridge: autochat \u0111\xE3 t\u1EAFt cho phi\xEAn n\xE0y.",
+  autochatUnlimitedTui: "AgentBridge: autochat unlimited b\u1EADt t\u1EEB l\u1EC7nh TUI.",
+  autochatBadMinutes: "AgentBridge: s\u1ED1 ph\xFAt ph\u1EA3i l\xE0 s\u1ED1 nguy\xEAn d\u01B0\u01A1ng (t\u1ED1i \u0111a 480).",
+  autochatMinutesClamped: (max) => `AgentBridge: th\u1EDDi h\u1EA1n autochat t\u1ED1i \u0111a ${max} ph\xFAt; \u0111\xE3 k\u1EB9p v\u1EC1 ${max}.`,
+  autochatLimitedTui: (minutes) => minutes === undefined ? "AgentBridge: autochat limited b\u1EADt t\u1EEB l\u1EC7nh TUI." : `AgentBridge: autochat limited b\u1EADt t\u1EEB l\u1EC7nh TUI trong ${minutes} ph\xFAt.`,
+  autochatExpired: "AgentBridge: autochat limited \u0111\xE3 h\u1EBFt h\u1EA1n.",
+  autochatModeTui: (mode) => `AgentBridge: autochat ${mode} b\u1EADt t\u1EEB l\u1EC7nh TUI.`,
+  autochatModeCli: (mode, flag) => `AgentBridge: autochat ${mode} b\u1EADt t\u1EEB CLI (--${flag}).`,
+  autochatBadFlag: (flag, value) => `AgentBridge: b\u1ECF qua c\u1EDD --${flag} kh\xF4ng h\u1EE3p l\u1EC7 (${value}).`,
+  autochatConfigUnchecked: (reason) => `AgentBridge: b\u1ECF qua chat.autoApprove v\xEC kh\xF4ng ki\u1EC3m tra \u0111\u01B0\u1EE3c config (${reason.slice(0, 160)}).`,
+  autochatLimitedState: (used, quota, source) => `limited ${used}/${quota} (${source})`,
+  autochatUnlimitedState: (used, source) => `unlimited \u221E \xB7 ${used} tin (${source})`,
+  widgetCleared: "AgentBridge: \u0111\xE3 xo\xE1 widget.",
+  commandUsage: "AgentBridge: d\xF9ng /agentbridge [status|trust|untrust|autochat|off|on|clear|allow|disallow|config].",
+  error: (message) => `AgentBridge l\u1ED7i: ${message.slice(0, 300)}`,
+  statusBar: (canAnswer) => canAnswer ? "\uD83D\uDD17 bridge" : "\uD83D\uDD17 bridge (status-only)",
+  statusLines: (fields) => [
+    "AgentBridge",
+    `endpoint: ${fields.endpoint ?? "(ch\u01B0a c\xF4ng b\u1ED1)"}`,
+    `session: ${fields.sessionId}`,
+    `tr\u1EA1ng th\xE1i: ${fields.status}`,
+    `project: ${fields.projectAllowed ? "\u0111\u01B0\u1EE3c ph\xE9p" : "kh\xF4ng \u0111\u01B0\u1EE3c ph\xE9p"}`,
+    `consent: ${fields.consent}${fields.trusted ? " (trusted trong phi\xEAn)" : ""}`,
+    `autochat: ${fields.autochat}`,
+    `request: ${fields.requests}`
+  ]
+};
+var AUTOCHAT_TEXT = {
+  unlimitedWarning: "Claude c\xF3 th\u1EC3 g\u1EEDi tin v\xE0 khi\u1EBFn OMP ch\u1EA1y tool kh\xF4ng c\u1EA7n duy\u1EC7t; quy\u1EC1n tool c\u1EE7a OMP v\u1EABn \xE1p d\u1EE5ng",
+  source: { config: "config", cli: "CLI", tui: "l\u1EC7nh TUI" },
+  limitClamped: (maxChars, maxMessages, minIntervalMs) => `AgentBridge: gi\u1EDBi h\u1EA1n autochat v\u01B0\u1EE3t m\u1EE9c an to\xE0n; \u0111\xE3 k\u1EB9p v\u1EC1 autoMaxChars \u2264 ${maxChars}, autoMaxMessages \u2264 ${maxMessages}, autoMinIntervalMs \u2265 ${minIntervalMs}.`,
+  sent: (used, quota) => `AgentBridge: t\u1EF1 g\u1EEDi tin t\u1EEB Claude (${quota === undefined ? used : `${used}/${quota}`})`,
+  configInsideProject: (path) => `AgentBridge: b\u1ECF qua chat.autoApprove v\xEC config n\u1EB1m trong project (${path}); chuy\u1EC3n config ra ngo\xE0i project`,
+  configInsecure: (path) => `AgentBridge: b\u1ECF qua chat.autoApprove v\xEC file config ph\u1EA3i c\xF3 quy\u1EC1n 0600 v\xE0 c\xF9ng uid (${path})`,
+  enabledFromConfig: (mode, path) => `AgentBridge: autochat ${mode} b\u1EADt t\u1EEB config ${path}`,
+  statusLimited: (base, used, quota) => `${base} \xB7 autochat ${used}/${quota}`,
+  statusUnlimited: (base, used) => `${base} \xB7 autochat \u221E \xB7 ${used} tin`
+};
+var CONFIG_TEXT = {
+  notRegularFile: "config ph\u1EA3i l\xE0 regular file, kh\xF4ng ph\u1EA3i symlink",
+  badMode: "config ph\u1EA3i c\xF3 quy\u1EC1n 0600 v\xE0 c\xF9ng uid",
+  unsafeParent: "th\u01B0 m\u1EE5c config kh\xF4ng an to\xE0n"
+};
+var COMPLETION_TEXT = {
+  subcommands: {
+    status: "Tr\u1EA1ng th\xE1i server, phi\xEAn v\xE0 autochat",
+    trust: "Tin c\u1EADy phi\xEAn n\xE0y (ch\u1EC9 trong b\u1ED9 nh\u1EDB)",
+    untrust: "B\u1ECF tin c\u1EADy phi\xEAn n\xE0y",
+    autochat: "Ch\u1EBF \u0111\u1ED9 t\u1EF1 duy\u1EC7t: off | limited [ph\xFAt] | unlimited",
+    allow: "Cho ph\xE9p project hi\u1EC7n t\u1EA1i",
+    disallow: "B\u1ECF cho ph\xE9p project hi\u1EC7n t\u1EA1i",
+    config: "Xem c\u1EA5u h\xECnh AgentBridge",
+    off: "T\u1EAFt server cho phi\xEAn n\xE0y",
+    on: "B\u1EADt l\u1EA1i server cho phi\xEAn n\xE0y",
+    clear: "Xo\xE1 widget"
+  },
+  autochatModes: {
+    off: "T\u1EAFt autochat",
+    limited: "T\u1EF1 duy\u1EC7t c\xF3 gi\u1EDBi h\u1EA1n, tu\u1EF3 ch\u1ECDn s\u1ED1 ph\xFAt (t\u1ED1i \u0111a 480)",
+    unlimited: "T\u1EF1 duy\u1EC7t kh\xF4ng gi\u1EDBi h\u1EA1n"
+  }
+};
+var EXTENSION_TEXT = {
+  autochatFlag: "AgentBridge autochat: off | limited | unlimited (l\u1EC7nh TUI \u01B0u ti\xEAn h\u01A1n c\u1EDD n\xE0y; config l\xE0 ph\u01B0\u01A1ng \xE1n cu\u1ED1i)",
+  command: "AgentBridge: status, trust, untrust, autochat, allow, disallow, config, off, on, clear"
+};
+
 // packages/omp-extension/src/autochat.ts
 var AUTOCHAT_FLAG = "agentbridge-autochat";
-var AUTO_UNLIMITED_WARNING = "Claude c\xF3 th\u1EC3 g\u1EEDi tin v\xE0 khi\u1EBFn OMP ch\u1EA1y tool kh\xF4ng c\u1EA7n duy\u1EC7t; quy\u1EC1n tool c\u1EE7a OMP v\u1EABn \xE1p d\u1EE5ng";
+var AUTO_UNLIMITED_WARNING = AUTOCHAT_TEXT.unlimitedWarning;
 var AUTOCHAT_LIMITED_MAX_MINUTES = 480;
 var MANUAL_CONSENT = "manual";
 function autoConsentReason(mode, source) {
@@ -1785,11 +1957,7 @@ function readAutoApproveFlag(value) {
   return { present: true, invalid: value.slice(0, 80) };
 }
 function autoSourceLabel(source) {
-  if (source === "config")
-    return "config";
-  if (source === "cli")
-    return "CLI";
-  return "l\u1EC7nh TUI";
+  return AUTOCHAT_TEXT.source[source];
 }
 var DEFAULT_AUTO_CHAT_LIMITS = {
   maxChars: AUTO_MAX_CHARS_DEFAULT,
@@ -1806,10 +1974,10 @@ function clampAutoChatLimits(chat) {
   return { limits, clamped };
 }
 function autoLimitClampWarning() {
-  return `AgentBridge: gi\u1EDBi h\u1EA1n autochat v\u01B0\u1EE3t m\u1EE9c an to\xE0n; \u0111\xE3 k\u1EB9p v\u1EC1 autoMaxChars \u2264 ${AUTO_MAX_CHARS_CAP}, autoMaxMessages \u2264 ${AUTO_MAX_MESSAGES_CAP}, autoMinIntervalMs \u2265 ${AUTO_MIN_INTERVAL_MS_FLOOR}.`;
+  return AUTOCHAT_TEXT.limitClamped(AUTO_MAX_CHARS_CAP, AUTO_MAX_MESSAGES_CAP, AUTO_MIN_INTERVAL_MS_FLOOR);
 }
 function autoSentMessage(used, quota) {
-  return `AgentBridge: t\u1EF1 g\u1EEDi tin t\u1EEB Claude (${quota === undefined ? used : `${used}/${quota}`})`;
+  return AUTOCHAT_TEXT.sent(used, quota);
 }
 function charCount(text) {
   let count = 0;
@@ -1882,16 +2050,13 @@ class AutoChatSession {
 }
 function isPathInside(child, parent) {
   const rel = relative(parent, child);
-  return rel === "" || rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute2(rel);
+  return rel === "" || rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute3(rel);
 }
 function autoConfigWarningMessage(reason, path) {
-  if (reason === "inside-project") {
-    return `AgentBridge: b\u1ECF qua chat.autoApprove v\xEC config n\u1EB1m trong project (${path}); chuy\u1EC3n config ra ngo\xE0i project`;
-  }
-  return `AgentBridge: b\u1ECF qua chat.autoApprove v\xEC file config ph\u1EA3i c\xF3 quy\u1EC1n 0600 v\xE0 c\xF9ng uid (${path})`;
+  return reason === "inside-project" ? AUTOCHAT_TEXT.configInsideProject(path) : AUTOCHAT_TEXT.configInsecure(path);
 }
 function autoConfigEnabledMessage(mode, path) {
-  return `AgentBridge: autochat ${mode} b\u1EADt t\u1EEB config ${path}`;
+  return AUTOCHAT_TEXT.enabledFromConfig(mode, path);
 }
 async function inspectConfigAutoApprove(options) {
   const mode = options.config.chat.autoApprove;
@@ -1924,29 +2089,22 @@ function bridgeStatusText(base, state, chatEnabled) {
   if (!chatEnabled || state.mode === "off")
     return base;
   if (state.mode === "limited") {
-    return `${base} \xB7 autochat ${state.used}/${state.quota ?? 0}`;
+    return AUTOCHAT_TEXT.statusLimited(base, state.used, state.quota ?? 0);
   }
-  return `${base} \xB7 autochat \u221E \xB7 ${state.used} tin`;
+  return AUTOCHAT_TEXT.statusUnlimited(base, state.used);
 }
 
 // packages/omp-extension/src/completions.ts
-var AGENTBRIDGE_SUBCOMMANDS = [
-  { name: "status", description: "Tr\u1EA1ng th\xE1i server, phi\xEAn v\xE0 autochat" },
-  { name: "trust", description: "Tin c\u1EADy phi\xEAn n\xE0y (ch\u1EC9 trong b\u1ED9 nh\u1EDB)" },
-  { name: "untrust", description: "B\u1ECF tin c\u1EADy phi\xEAn n\xE0y" },
-  { name: "autochat", description: "Ch\u1EBF \u0111\u1ED9 t\u1EF1 duy\u1EC7t: off | limited [ph\xFAt] | unlimited" },
-  { name: "allow", description: "Cho ph\xE9p project hi\u1EC7n t\u1EA1i" },
-  { name: "disallow", description: "B\u1ECF cho ph\xE9p project hi\u1EC7n t\u1EA1i" },
-  { name: "config", description: "Xem c\u1EA5u h\xECnh AgentBridge" },
-  { name: "off", description: "T\u1EAFt server cho phi\xEAn n\xE0y" },
-  { name: "on", description: "B\u1EADt l\u1EA1i server cho phi\xEAn n\xE0y" },
-  { name: "clear", description: "Xo\xE1 widget" }
-];
-var AUTOCHAT_MODES = [
-  { name: "off", description: "T\u1EAFt autochat" },
-  { name: "limited", description: "T\u1EF1 duy\u1EC7t c\xF3 gi\u1EDBi h\u1EA1n, tu\u1EF3 ch\u1ECDn s\u1ED1 ph\xFAt (t\u1ED1i \u0111a 480)" },
-  { name: "unlimited", description: "T\u1EF1 duy\u1EC7t kh\xF4ng gi\u1EDBi h\u1EA1n" }
-];
+var SUBCOMMAND_NAMES = ["status", "trust", "untrust", "autochat", "allow", "disallow", "config", "off", "on", "clear"];
+var AUTOCHAT_MODE_NAMES = ["off", "limited", "unlimited"];
+var AGENTBRIDGE_SUBCOMMANDS = SUBCOMMAND_NAMES.map((name) => ({
+  name,
+  description: COMPLETION_TEXT.subcommands[name]
+}));
+var AUTOCHAT_MODES = AUTOCHAT_MODE_NAMES.map((name) => ({
+  name,
+  description: COMPLETION_TEXT.autochatModes[name]
+}));
 function match2(choices, typed, lead) {
   const lower = typed.toLowerCase();
   const items = choices.filter((choice) => choice.name.startsWith(lower)).map((choice) => ({ value: `${lead}${choice.name} `, label: choice.name, description: choice.description }));
@@ -2029,9 +2187,9 @@ function createOmpLike(pi, extensionVersion) {
     },
     isIdle(ctx) {
       try {
-        return typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+        return typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
       } catch {
-        return true;
+        return false;
       }
     },
     hasPendingMessages(ctx) {
@@ -2061,7 +2219,15 @@ function createOmpLike(pi, extensionVersion) {
     async select(ctx, title, options, dialogOptions) {
       if (typeof ctx.ui.select !== "function")
         throw new Error("ctx.ui.select is unavailable");
-      return ctx.ui.select(title, options, dialogOptions);
+      let timedOut = false;
+      const choice = await ctx.ui.select(title, options, {
+        ...dialogOptions,
+        onTimeout: () => {
+          timedOut = true;
+          dialogOptions?.onTimeout?.();
+        }
+      });
+      return timedOut ? undefined : choice;
     },
     async runEphemeralTurn(ctx, options) {
       if (typeof ctx.runEphemeralTurn !== "function") {
@@ -2122,11 +2288,121 @@ function createOmpLike(pi, extensionVersion) {
   };
 }
 
+// packages/omp-extension/src/consent.ts
+function callerLabel(sessionId) {
+  return sanitizeLabel(sessionId, 128).replace(/[()[\]]/g, "_");
+}
+var CONSENT_SNIPPET_CHARS = 300;
+var CONSENT_MAX_LINES = 8;
+var VIEW_PAGE_CHARS = 1000;
+var VIEW_PAGE_LINES = 14;
+var TAB_AS_SPACES = "  ";
+function sanitizeDialogText(text, maxChars = Number.POSITIVE_INFINITY, maxLines = CONSENT_MAX_LINES) {
+  const cleaned = sanitizeText(text).replace(/\t/g, TAB_AS_SPACES);
+  const lines = [];
+  for (const raw of cleaned.split(`
+`)) {
+    const line = raw.replace(/\s+$/u, "");
+    const previousBlank = lines.length === 0 || lines[lines.length - 1] === "";
+    if (line.length === 0 && previousBlank)
+      continue;
+    lines.push(line);
+    if (lines.length === maxLines)
+      break;
+  }
+  while (lines.length > 0 && lines[lines.length - 1] === "")
+    lines.pop();
+  const bounded = lines.join(`
+`);
+  return bounded.length > maxChars ? bounded.slice(0, maxChars) : bounded;
+}
+function buildConsentView(payload) {
+  const full = sanitizeDialogText(payload, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+  const shown = sanitizeDialogText(full, CONSENT_SNIPPET_CHARS, CONSENT_MAX_LINES);
+  const truncated = full.length > shown.length;
+  const lines = full.length === 0 ? 1 : full.split(`
+`).length;
+  const hidden = truncated ? full.length - shown.length : 0;
+  return {
+    full,
+    snippet: truncated ? `${shown}\u2026` : shown,
+    sizeLine: CONSENT_TEXT.size(lines, full.length, hidden),
+    truncated
+  };
+}
+function paginateText(text, maxChars = VIEW_PAGE_CHARS, maxLines = VIEW_PAGE_LINES) {
+  if (maxChars <= 0 || maxLines <= 0)
+    return [text];
+  const pages = [];
+  let current = [];
+  let currentChars = 0;
+  const flush = () => {
+    if (current.length === 0)
+      return;
+    pages.push(current.join(`
+`));
+    current = [];
+    currentChars = 0;
+  };
+  for (const rawLine of text.split(`
+`)) {
+    let points = Array.from(rawLine);
+    while (points.length > maxChars) {
+      flush();
+      pages.push(points.slice(0, maxChars).join(""));
+      points = points.slice(maxChars);
+    }
+    const line = points.join("");
+    const lineChars = points.length;
+    if (current.length > 0 && (current.length >= maxLines || currentChars + 1 + lineChars > maxChars)) {
+      flush();
+    }
+    current.push(line);
+    currentChars = current.length === 1 ? lineChars : currentChars + 1 + lineChars;
+  }
+  flush();
+  return pages.length > 0 ? pages : [""];
+}
+async function runPagedConsent(options) {
+  const finalChoice = (choice) => {
+    if (choice === undefined)
+      return;
+    return options.finalOptions.includes(choice) ? choice : options.denyOption;
+  };
+  const ask = async (title, labels) => {
+    const choice = await options.select(title, labels, Math.max(0, labels.indexOf(options.denyOption)));
+    return choice !== undefined && options.expired?.() === true ? undefined : choice;
+  };
+  options.beforeDialog?.();
+  if (!options.view.truncated) {
+    return finalChoice(await ask(options.title(options.view.snippet), [...options.finalOptions]));
+  }
+  const initial = await ask(options.title(options.view.snippet), [CONSENT_TEXT.viewFull, options.denyOption]);
+  if (initial === undefined)
+    return;
+  if (initial !== CONSENT_TEXT.viewFull)
+    return options.denyOption;
+  const pages = paginateText(options.view.full);
+  for (let index = 0;index < pages.length; index += 1) {
+    options.beforeDialog?.();
+    const last = index === pages.length - 1;
+    const choice = await ask(options.title(pages[index] ?? "", { index: index + 1, total: pages.length }), last ? [...options.finalOptions] : [CONSENT_TEXT.nextPage, options.denyOption]);
+    if (choice === undefined)
+      return;
+    if (last)
+      return finalChoice(choice);
+    if (choice !== CONSENT_TEXT.nextPage)
+      return options.denyOption;
+  }
+  return options.denyOption;
+}
+
 // packages/omp-extension/src/prompt.ts
 var CALLER_LABEL = "Claude Code";
 var SHORT_SESSION_CHARS = 8;
 function shortSession(sessionId) {
-  return sessionId.length > SHORT_SESSION_CHARS ? sessionId.slice(0, SHORT_SESSION_CHARS) : sessionId;
+  const label = callerLabel(sessionId);
+  return label.length > SHORT_SESSION_CHARS ? label.slice(0, SHORT_SESSION_CHARS) : label;
 }
 function fenceFor(text) {
   let longest = 0;
@@ -2173,39 +2449,14 @@ function buildPrompt(question, attachments, callerSessionId) {
 
 // packages/omp-extension/src/consult.ts
 var CONSENT_OPTIONS = [
-  "Cho ph\xE9p l\u1EA7n n\xE0y",
-  "Cho ph\xE9p trong phi\xEAn n\xE0y",
-  "T\u1EEB ch\u1ED1i"
+  CONSULT_TEXT.allowOnce,
+  CONSULT_TEXT.allowSession,
+  CONSULT_TEXT.deny
 ];
-var CONSENT_TITLE = "AgentBridge: Claude Code mu\u1ED1n h\u1ECFi \xFD ki\u1EBFn";
-var CONSENT_SNIPPET_CHARS = 300;
-var CONSENT_MAX_LINES = 8;
+var CONSENT_TITLE = CONSULT_TEXT.consentTitle;
 var CONSENT_SESSION_CHARS = 128;
-var DIALOG_CONTROL_CHARS = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
-var DIALOG_BIDI_OVERRIDES = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
-var ANSI_ESCAPE_SEQUENCES = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\)|[@-_])|\u009b[0-?]*[ -/]*[@-~]/g;
-function stripUnsafeText(text) {
-  return text.replace(ANSI_ESCAPE_SEQUENCES, "").replace(DIALOG_CONTROL_CHARS, "").replace(DIALOG_BIDI_OVERRIDES, "");
-}
-function sanitizeDialogText(text, maxChars = Number.POSITIVE_INFINITY, maxLines = CONSENT_MAX_LINES) {
-  const cleaned = stripUnsafeText(text);
-  const lines = [];
-  for (const raw of cleaned.split(`
-`)) {
-    const line = raw.replace(/\s+$/u, "");
-    const previousBlank = lines.length === 0 || lines[lines.length - 1] === "";
-    if (line.length === 0 && previousBlank)
-      continue;
-    lines.push(line);
-    if (lines.length === maxLines)
-      break;
-  }
-  while (lines.length > 0 && lines[lines.length - 1] === "")
-    lines.pop();
-  const bounded = lines.join(`
-`);
-  return bounded.length > maxChars ? bounded.slice(0, maxChars) : bounded;
-}
+var CONSENT_MAX_ATTACHMENTS = 10;
+var ATTACHMENT_PATH_CHARS = 512;
 var MAX_TOKENS_REJECTION = /does not support maxTokens|cannot preserve maxTokens/i;
 var MODEL_OR_SESSION_CHANGED = /Active (?:model|session) changed/i;
 var USAGE_FIELDS2 = ["input", "output", "cacheRead", "cacheWrite", "cost"];
@@ -2280,18 +2531,36 @@ function pickUsage(usage) {
 function usageOf(result) {
   return pickUsage(result.assistantMessage?.usage);
 }
-function consentTitle(request, question) {
-  const cleanQuestion = sanitizeDialogText(question);
-  const snippet = cleanQuestion.length > CONSENT_SNIPPET_CHARS ? `${cleanQuestion.slice(0, CONSENT_SNIPPET_CHARS)}\u2026` : cleanQuestion;
-  const callerSession = sanitizeDialogText(request.from.sessionId, CONSENT_SESSION_CHARS);
-  const attachmentCount = request.body.attachments?.length ?? 0;
-  return [
-    CONSENT_TITLE,
-    "",
-    snippet,
-    "",
-    `\u0110\xEDnh k\xE8m: ${attachmentCount} \xB7 caller session: ${callerSession}`
-  ].join(`
+function consultPayload(body) {
+  const question = redact(sanitizeText(body.question)).text;
+  const attachments = (body.attachments ?? []).map((attachment) => {
+    const clean = {
+      path: sanitizeLabel(attachment.path, ATTACHMENT_PATH_CHARS),
+      text: redact(sanitizeText(attachment.text)).text
+    };
+    if (attachment.startLine !== undefined)
+      clean.startLine = attachment.startLine;
+    if (attachment.endLine !== undefined)
+      clean.endLine = attachment.endLine;
+    return clean;
+  });
+  return { question, attachments };
+}
+function consentTitle(request, attachments, sizeLine, body, page) {
+  const callerSession = sanitizeDialogText(callerLabel(request.from.sessionId), CONSENT_SESSION_CHARS, 1);
+  const lines = [CONSENT_TITLE, ""];
+  if (page !== undefined)
+    lines.push(CONSENT_TEXT.page(page.index, page.total));
+  if (body.length > 0)
+    lines.push(body, "");
+  lines.push(sizeLine, CONSULT_TEXT.attachmentsLine(attachments.length, callerSession));
+  for (const attachment of attachments.slice(0, CONSENT_MAX_ATTACHMENTS)) {
+    lines.push(CONSULT_TEXT.attachmentItem(sanitizeDialogText(locationOf(attachment), 160, 1)));
+  }
+  if (attachments.length > CONSENT_MAX_ATTACHMENTS) {
+    lines.push(CONSULT_TEXT.moreAttachments(attachments.length - CONSENT_MAX_ATTACHMENTS));
+  }
+  return lines.join(`
 `);
 }
 
@@ -2349,9 +2618,39 @@ class RequestDedupe {
 }
 var DELTA_FLUSH_BYTES = 4 * 1024;
 var PEM_HEADER = "-----BEGIN";
+var KEYWORD_AT_END = /(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)$/i;
+var KEYWORD_WINDOW = 12;
+var MAX_HELD_CHARS = 4 * 1024;
+function isSpaceOrQuote(char) {
+  const code = char.charCodeAt(0);
+  if (code === 32 || code === 9 || code === 10 || code === 34 || code === 39)
+    return true;
+  return code > 127 && /\s/.test(char);
+}
+function openAssignmentStart(text, end) {
+  const floor = Math.max(0, end - MAX_HELD_CHARS);
+  let index = end;
+  let separator = false;
+  while (index > floor) {
+    const char = text.charAt(index - 1);
+    if (isSpaceOrQuote(char))
+      index -= 1;
+    else if (!separator && (char === ":" || char === "=")) {
+      separator = true;
+      index -= 1;
+    } else
+      break;
+  }
+  if (index === floor && floor > 0)
+    return -1;
+  const window = text.slice(Math.max(0, index - KEYWORD_WINDOW), index);
+  const match = KEYWORD_AT_END.exec(window);
+  return match === null ? -1 : index - window.length + match.index;
+}
 
 class RedactingDeltaStream {
   #pending = "";
+  #carry = "";
   #muted = false;
   #send;
   constructor(send) {
@@ -2360,17 +2659,18 @@ class RedactingDeltaStream {
   push(delta) {
     if (this.#muted || delta.length === 0)
       return;
-    this.#pending += delta;
-    while (true) {
-      const newline = this.#pending.indexOf(`
+    const raw = this.#carry + delta;
+    this.#carry = raw.endsWith("\r") ? "\r" : "";
+    this.#pending += sanitizeText(this.#carry === "" ? raw : raw.slice(0, -1));
+    const lastNewline = this.#pending.lastIndexOf(`
 `);
-      if (newline < 0)
-        break;
-      const line = this.#pending.slice(0, newline + 1);
-      this.#pending = this.#pending.slice(newline + 1);
-      this.#emit(line);
+    if (lastNewline >= 0) {
+      const complete = this.#pending.slice(0, lastNewline + 1);
+      const rest = this.#pending.slice(lastNewline + 1);
+      const held = this.#release(complete);
       if (this.#muted)
         return;
+      this.#pending = held + rest;
     }
     if (Buffer.byteLength(this.#pending, "utf8") > DELTA_FLUSH_BYTES)
       this.#flushToWhitespace();
@@ -2380,18 +2680,50 @@ class RedactingDeltaStream {
     if (lastWhitespace === null)
       return;
     const chunk = this.#pending.slice(0, lastWhitespace.index + 1);
-    this.#pending = this.#pending.slice(lastWhitespace.index + 1);
-    this.#emit(chunk);
+    const rest = this.#pending.slice(lastWhitespace.index + 1);
+    const held = this.#release(chunk);
+    if (this.#muted)
+      return;
+    this.#pending = held + rest;
+  }
+  #release(text) {
+    const floor = Math.max(0, text.length - MAX_HELD_CHARS);
+    let cut = text.length;
+    let name = openAssignmentStart(text, cut);
+    while (name >= 0) {
+      cut = name;
+      while (cut > floor && !isSpaceOrQuote(text.charAt(cut - 1)))
+        cut -= 1;
+      if (cut <= floor && floor > 0) {
+        cut = text.length;
+        break;
+      }
+      name = openAssignmentStart(text, cut);
+    }
+    const ready = text.slice(0, cut);
+    const pem = ready.indexOf(PEM_HEADER);
+    if (pem >= 0) {
+      this.#emit(ready.slice(0, ready.lastIndexOf(`
+`, pem) + 1));
+      this.#muted = true;
+      this.#pending = "";
+      return "";
+    }
+    this.#emit(ready);
+    return text.slice(cut);
   }
   #emit(text) {
     if (this.#muted || text.length === 0)
       return;
-    if (text.includes(PEM_HEADER)) {
-      this.#muted = true;
-      this.#pending = "";
-      return;
+    const clean = redact(sanitizeText(text)).text;
+    let start = 0;
+    while (start < clean.length) {
+      const newline = clean.indexOf(`
+`, start);
+      const end = newline < 0 ? clean.length : newline + 1;
+      this.#send(clean.slice(start, end));
+      start = end;
     }
-    this.#send(redact(text).text);
   }
 }
 var WIDGET_THROTTLE_MS = 200;
@@ -2407,7 +2739,7 @@ function scheduleWidgetTimer(callback, ms) {
   return timer;
 }
 function widgetLine(text, maxChars = WIDGET_LINE_CHARS) {
-  const clean = stripUnsafeText(text).replace(/[\r\n]+/g, " ");
+  const clean = sanitizeText(text).replace(/\t/g, "  ").replace(/\n+/g, " ");
   return clean.length > maxChars ? `${clean.slice(0, maxChars - 1)}\u2026` : clean;
 }
 function widgetTailLineLimit(widgetLines, questionLines) {
@@ -2504,13 +2836,14 @@ class ConsultManager {
       }
       this.#inFlight += 1;
       try {
+        const payload = consultPayload(request.body);
         const mode = request.isTrusted() ? "always" : config.consult.consent;
         if (mode === "deny") {
           throw new ConsultFailure("denied", "consent policy is deny", "denied");
         }
         if (mode === "ask" || mode === "session") {
           request.sendProgress({ phase: "awaiting_consent" });
-          const choice = await this.#selectConsent(request, config, request.body.question);
+          const choice = await this.#selectConsent(request, config, payload);
           if (request.signal.aborted) {
             throw new ConsultFailure("cancelled", "client disconnected during consent");
           }
@@ -2531,8 +2864,8 @@ class ConsultManager {
         }
         request.sendProgress({ phase: "running" });
         if (config.ui.liveWidget)
-          widget = this.#beginWidget(request, config.ui);
-        const prompt = buildPrompt(request.body.question, attachments, request.from.sessionId);
+          widget = this.#beginWidget(request, payload.question, config.ui);
+        const prompt = buildPrompt(payload.question, payload.attachments, request.from.sessionId);
         const limitReply = request.body.limits?.replyMaxBytes;
         const limitTokens = request.body.limits?.maxTokens;
         const replyMaxBytes = Math.min(config.consult.replyMaxBytes, limitReply ?? Number.POSITIVE_INFINITY);
@@ -2575,7 +2908,7 @@ class ConsultManager {
             throw failure;
           }
         }
-        const redacted = redact(typeof result.replyText === "string" ? result.replyText : "");
+        const redacted = redact(sanitizeText(typeof result.replyText === "string" ? result.replyText : ""));
         const limited = truncateUtf8(redacted.text, replyMaxBytes);
         const replyText = limited.text;
         const usedModel = this.#omp.model(request.ctx) ?? request.model ?? UNKNOWN_MODEL;
@@ -2585,9 +2918,9 @@ class ConsultManager {
         const durationMs = Date.now() - startedAt;
         outcome = "ok";
         if (widget !== undefined) {
-          this.#finalizeWidget(widget, `\u2713 \u0111\xE3 tr\u1EA3 l\u1EDDi Claude (${durationMs}ms)`);
+          this.#finalizeWidget(widget, CONSULT_TEXT.widgetDone(durationMs));
         }
-        this.#omp.notify(request.ctx, `AgentBridge: \u0111\xE3 tr\u1EA3 l\u1EDDi Claude (${durationMs}ms)`, "info");
+        this.#omp.notify(request.ctx, CONSULT_TEXT.answered(durationMs), "info");
         return {
           replyText,
           truncated: limited.truncated,
@@ -2614,7 +2947,7 @@ class ConsultManager {
         outcome = "internal";
       }
       if (widget !== undefined)
-        this.#finalizeWidget(widget, `\u2717 ${code}`);
+        this.#finalizeWidget(widget, CONSULT_TEXT.widgetFailed(code));
       throw error;
     } finally {
       if (config !== undefined) {
@@ -2622,16 +2955,16 @@ class ConsultManager {
       }
     }
   }
-  #beginWidget(request, ui) {
+  #beginWidget(request, questionText, ui) {
     this.#disposeWidget();
-    const caller = widgetLine(request.from.sessionId, WIDGET_CALLER_CHARS);
-    const question = widgetQuestionLines(request.body.question);
+    const caller = widgetLine(callerLabel(request.from.sessionId), WIDGET_CALLER_CHARS);
+    const question = widgetQuestionLines(questionText);
     const state = {
       ctx: request.ctx,
       question,
       tail: new WidgetStreamTail(widgetTailLineLimit(ui.widgetLines, question.length)),
       holdMs: ui.widgetHoldMs,
-      header: `\u25C6 AgentBridge \xB7 Claude \u0111ang h\u1ECFi \xB7 ${caller}`,
+      header: CONSULT_TEXT.widgetHeader(caller),
       lastRenderAt: Date.now(),
       finished: false
     };
@@ -2705,19 +3038,35 @@ class ConsultManager {
       this.#omp.setWidget(ctx ?? state.ctx, undefined);
     } catch {}
   }
-  async#selectConsent(request, config, question) {
-    const dialogOptions = {
-      timeout: config.consult.consentTimeoutMs,
-      signal: request.signal
-    };
-    try {
-      return await this.#omp.select(request.ctx, consentTitle(request, question), [...CONSENT_OPTIONS], dialogOptions);
-    } catch (error) {
-      if (request.signal.aborted) {
-        throw new ConsultFailure("cancelled", "client disconnected during consent");
+  async#selectConsent(request, config, payload) {
+    const view = buildConsentView(payload.question);
+    const deadline = Date.now() + config.consult.consentTimeoutMs;
+    return runPagedConsent({
+      view,
+      title: (body, page) => consentTitle(request, payload.attachments, view.sizeLine, body, page),
+      finalOptions: CONSENT_OPTIONS,
+      denyOption: CONSULT_TEXT.deny,
+      beforeDialog: () => {
+        if (Date.now() >= deadline)
+          throw new ConsultFailure("consent_timeout", "consent dialog timed out");
+      },
+      expired: () => Date.now() >= deadline,
+      select: async (title, options, initialIndex) => {
+        const dialogOptions = {
+          timeout: Math.max(1, deadline - Date.now()),
+          signal: request.signal,
+          initialIndex
+        };
+        try {
+          return await this.#omp.select(request.ctx, title, options, dialogOptions);
+        } catch (error) {
+          if (request.signal.aborted) {
+            throw new ConsultFailure("cancelled", "client disconnected during consent");
+          }
+          throw new ConsultFailure("internal", `ui.select failed: ${redactedMessage(error)}`, "error");
+        }
       }
-      throw new ConsultFailure("internal", `ui.select failed: ${redactedMessage(error)}`, "error");
-    }
+    });
   }
   async#record(request, config, event, outcome, question, reply, usage, model, durationMs) {
     const audit = {
@@ -2750,24 +3099,21 @@ class ConsultManager {
 }
 
 // packages/omp-extension/src/chat.ts
-var CHAT_SEND_OPTION = "G\u1EEDi";
-var CHAT_DENY_OPTION = "T\u1EEB ch\u1ED1i";
+var CHAT_SEND_OPTION = CHAT_TEXT.send;
+var CHAT_DENY_OPTION = CHAT_TEXT.deny;
 var CHAT_CONSENT_OPTIONS = [CHAT_SEND_OPTION, CHAT_DENY_OPTION];
-var CHAT_VIEW_FULL_OPTION = "Xem to\xE0n v\u0103n";
-var CHAT_NEXT_PAGE_OPTION = "Trang sau";
-var CHAT_CONSENT_TITLE = "AgentBridge: Claude Code mu\u1ED1n g\u1EEDi tin v\xE0o phi\xEAn OMP";
-var CONSENT_SNIPPET_CHARS2 = 300;
-var CONSENT_MAX_LINES2 = 8;
-var VIEW_PAGE_CHARS = 1000;
-var VIEW_PAGE_LINES = 14;
+var CHAT_VIEW_FULL_OPTION = CONSENT_TEXT.viewFull;
+var CHAT_NEXT_PAGE_OPTION = CONSENT_TEXT.nextPage;
+var CHAT_CONSENT_TITLE = CHAT_TEXT.consentTitle;
 var CALLER_CHARS = 160;
 var ERROR_MESSAGE_CHARS2 = 500;
 function buildChatFrame(message, callerSessionId) {
-  const caller = callerSessionId.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 128);
-  return `[Tin nh\u1EAFn t\u1EEB Claude Code (phi\xEAn ${caller}), chuy\u1EC3n qua AgentBridge \u2014 kh\xF4ng ph\u1EA3i ng\u01B0\u1EDDi d\xF9ng g\xF5]
-
-${message}`;
+  return CHAT_TEXT.frame(callerLabel(callerSessionId), message);
 }
+function chatPayload(message) {
+  return redact(sanitizeText(message)).text;
+}
+var paginateChatText = paginateText;
 function redactedError(error) {
   return redact(errorMessage(error)).text.slice(0, ERROR_MESSAGE_CHARS2);
 }
@@ -2827,58 +3173,14 @@ function usageOf2(message) {
 function containsFrame(messages, frame) {
   return messages.some((message) => message.role === "user" && messageText(message).includes(frame));
 }
-function buildChatConsentView(message) {
-  const redacted = redact(message).text;
-  const full = sanitizeDialogText(redacted, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
-  const snippet = sanitizeDialogText(full, CONSENT_SNIPPET_CHARS2, CONSENT_MAX_LINES2);
-  const truncated = full.length > snippet.length;
-  const lines = full.length === 0 ? 1 : full.split(`
-`).length;
-  const hidden = truncated ? full.length - snippet.length : 0;
-  const sizeLine = `K\xEDch th\u01B0\u1EDBc: ${lines} d\xF2ng \xB7 ${full.length} k\xFD t\u1EF1${truncated ? ` (\u0111\xE3 \u1EA9n ${hidden} k\xFD t\u1EF1)` : ""}`;
-  return { full, snippet, sizeLine, truncated };
-}
-function paginateChatText(text, maxChars = VIEW_PAGE_CHARS, maxLines = VIEW_PAGE_LINES) {
-  if (maxChars <= 0 || maxLines <= 0)
-    return [text];
-  const pages = [];
-  let current = [];
-  let currentChars = 0;
-  const flush = () => {
-    if (current.length === 0)
-      return;
-    pages.push(current.join(`
-`));
-    current = [];
-    currentChars = 0;
-  };
-  for (const rawLine of text.split(`
-`)) {
-    let points = Array.from(rawLine);
-    while (points.length > maxChars) {
-      flush();
-      pages.push(points.slice(0, maxChars).join(""));
-      points = points.slice(maxChars);
-    }
-    const line = points.join("");
-    const lineChars = points.length;
-    if (current.length > 0 && (current.length >= maxLines || currentChars + 1 + lineChars > maxChars)) {
-      flush();
-    }
-    current.push(line);
-    currentChars = current.length === 1 ? lineChars : currentChars + 1 + lineChars;
-  }
-  flush();
-  return pages.length > 0 ? pages : [""];
-}
 function consentCaller(request) {
-  return sanitizeDialogText(`${request.from.agent} \xB7 phi\xEAn ${request.from.sessionId}`, CALLER_CHARS);
+  return sanitizeDialogText(CHAT_TEXT.caller(request.from.agent, callerLabel(request.from.sessionId)), CALLER_CHARS, 1);
 }
 function chatConsentTitle(request, body, sizeLine, page) {
   const lines = [CHAT_CONSENT_TITLE, ""];
   if (page !== undefined)
-    lines.push(`Trang ${page.index}/${page.total}`);
-  lines.push(body, "", sizeLine, `Caller: ${consentCaller(request)}`, "Tin n\xE0y s\u1EBD hi\u1EC7n trong transcript OMP; OMP c\xF3 th\u1EC3 ch\u1EA1y tool theo quy\u1EC1n c\u1EE7a ch\xEDnh n\xF3.");
+    lines.push(CONSENT_TEXT.page(page.index, page.total));
+  lines.push(body, "", sizeLine, CHAT_TEXT.callerLine(consentCaller(request)), CHAT_TEXT.transcriptWarning);
   return lines.join(`
 `);
 }
@@ -2932,6 +3234,7 @@ class ChatManager {
       if (request.signal.aborted) {
         throw new ChatFailure("cancelled", "client disconnected before consent");
       }
+      const payload = chatPayload(request.body.message);
       const deferred = Promise.withResolvers();
       deferred.promise.catch(() => {
         return;
@@ -2974,7 +3277,7 @@ class ChatManager {
       this.#armTimeout(current, request.body.timeoutMs);
       let auto;
       try {
-        auto = request.autoApprove?.(request.body.message, config);
+        auto = request.autoApprove?.(payload, config);
       } catch (error) {
         this.#report(current, error);
       }
@@ -2983,7 +3286,7 @@ class ChatManager {
       } else {
         current.consent = MANUAL_CONSENT;
         this.#progress(request, { phase: "awaiting_consent" });
-        const choicePromise = this.#selectConsent(request, current);
+        const choicePromise = this.#selectConsent(request, current, payload);
         choicePromise.catch(() => {
           return;
         });
@@ -3011,7 +3314,7 @@ class ChatManager {
       if (busy && !config.chat.queueWhenBusy) {
         throw new ChatFailure("busy", "OMP became busy and chat.queueWhenBusy is false");
       }
-      const frame = buildChatFrame(redact(request.body.message).text, request.from.sessionId);
+      const frame = buildChatFrame(payload, request.from.sessionId);
       current.frame = frame;
       current.sentWhileIdle = !busy;
       current.stream = new RedactingDeltaStream((delta) => {
@@ -3128,7 +3431,7 @@ class ChatManager {
         this.#settleError(pending, new ChatFailure("provider_error", detail.slice(0, ERROR_MESSAGE_CHARS2)));
         return;
       }
-      const redacted = redact(messageText(assistant));
+      const redacted = redact(sanitizeText(messageText(assistant)));
       const limited = truncateUtf8(redacted.text, pending.replyMaxBytes);
       const result = {
         replyText: limited.text,
@@ -3164,39 +3467,25 @@ class ChatManager {
       }
     }, timeoutMs);
   }
-  async#selectConsent(request, pending) {
-    const view = buildChatConsentView(request.body.message);
+  async#selectConsent(request, pending, payload) {
+    const view = buildConsentView(payload);
     pending.consentDeadline = Date.now() + pending.consentTimeoutMs;
-    this.#assertConsentTime(pending);
-    if (!view.truncated) {
-      return this.#selectDialog(request, pending, chatConsentTitle(request, view.snippet, view.sizeLine), [...CHAT_CONSENT_OPTIONS]);
-    }
-    const initial = await this.#selectDialog(request, pending, chatConsentTitle(request, view.snippet, view.sizeLine), [CHAT_VIEW_FULL_OPTION, CHAT_DENY_OPTION]);
-    if (initial !== CHAT_VIEW_FULL_OPTION)
-      return initial;
-    const pages = paginateChatText(view.full);
-    for (let index = 0;index < pages.length; index += 1) {
-      this.#assertConsentTime(pending);
-      const last = index === pages.length - 1;
-      const page = { index: index + 1, total: pages.length };
-      const choice = await this.#selectDialog(request, pending, chatConsentTitle(request, pages[index] ?? "", view.sizeLine, page), last ? [...CHAT_CONSENT_OPTIONS] : [CHAT_NEXT_PAGE_OPTION, CHAT_DENY_OPTION]);
-      if (choice === CHAT_SEND_OPTION && last)
-        return CHAT_SEND_OPTION;
-      if (choice === CHAT_DENY_OPTION)
-        return CHAT_DENY_OPTION;
-      if (choice === CHAT_NEXT_PAGE_OPTION && !last)
-        continue;
-      if (choice === undefined)
-        return;
-      return CHAT_DENY_OPTION;
-    }
-    return CHAT_DENY_OPTION;
+    return runPagedConsent({
+      view,
+      title: (body, page) => chatConsentTitle(request, body, view.sizeLine, page),
+      finalOptions: CHAT_CONSENT_OPTIONS,
+      denyOption: CHAT_DENY_OPTION,
+      beforeDialog: () => this.#assertConsentTime(pending),
+      expired: () => this.#consentExpired(pending),
+      select: (title, options, initialIndex) => this.#selectDialog(request, pending, title, options, initialIndex)
+    });
   }
-  async#selectDialog(request, pending, title, options) {
+  async#selectDialog(request, pending, title, options, initialIndex) {
     try {
       return await this.#omp.select(request.ctx, title, [...options], {
         timeout: dialogTimeout(pending),
-        signal: pending.abort.signal
+        signal: pending.abort.signal,
+        initialIndex
       });
     } catch (error) {
       if (pending.settled)
@@ -3280,7 +3569,7 @@ class ChatManager {
       from: { agent: request.from.agent, sessionId: request.from.sessionId },
       to: { sessionId: request.sessionId },
       project: request.project,
-      question: redact(request.body.message).text,
+      question: request.body.message,
       durationMs,
       outcome
     };
@@ -3312,7 +3601,7 @@ function dialogTimeout(pending) {
 
 // packages/omp-extension/src/project-config.ts
 import { lstat as lstat3, realpath as realpath4 } from "fs/promises";
-import { basename, dirname, join as join4, resolve as resolve3 } from "path";
+import { basename, dirname, isAbsolute as isAbsolute4, join as join4, resolve as resolve3 } from "path";
 function errorText(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -3327,7 +3616,7 @@ async function inspectConfig(configPath, options = {}) {
     return { kind: "insecure", configPath: path, reason: errorText(error) };
   }
   if (info.isSymbolicLink() || !info.isFile()) {
-    return { kind: "insecure", configPath: path, reason: "config ph\u1EA3i l\xE0 regular file, kh\xF4ng ph\u1EA3i symlink" };
+    return { kind: "insecure", configPath: path, reason: CONFIG_TEXT.notRegularFile };
   }
   let realPath;
   try {
@@ -3343,10 +3632,19 @@ async function inspectConfig(configPath, options = {}) {
   if (options.requireSecureMode !== false && process.platform !== "win32") {
     const uid = process.getuid?.();
     if (uid === undefined || info.uid !== uid || (info.mode & 511) !== 384) {
-      return { kind: "insecure", configPath: path, reason: "config ph\u1EA3i c\xF3 quy\u1EC1n 0600 v\xE0 c\xF9ng uid" };
+      return { kind: "insecure", configPath: path, reason: CONFIG_TEXT.badMode };
     }
   }
   return { kind: "ok", configPath: path, realPath, config: read.config, raw: read.raw };
+}
+async function canonicalProject(entry) {
+  if (!isAbsolute4(entry))
+    return;
+  try {
+    return await realpath4(entry);
+  } catch {
+    return resolve3(entry);
+  }
 }
 async function canonicalConfigPath(configPath) {
   try {
@@ -3357,6 +3655,8 @@ async function canonicalConfigPath(configPath) {
 }
 async function firstContainingProject(configRealPath, projects) {
   for (const project of projects) {
+    if (!isAbsolute4(project))
+      continue;
     let realProject;
     try {
       realProject = await realpath4(project);
@@ -3372,7 +3672,7 @@ async function ensureConfigParent(parent) {
   try {
     const info = await lstat3(parent);
     if (info.isSymbolicLink() || !info.isDirectory())
-      throw new Error("th\u01B0 m\u1EE5c config kh\xF4ng an to\xE0n");
+      throw new Error(CONFIG_TEXT.unsafeParent);
     return;
   } catch (error) {
     if (error.code !== "ENOENT")
@@ -3389,12 +3689,14 @@ async function changeProjectConfig(options) {
   if (inspected.kind === "insecure") {
     return { kind: "insecure", configPath, reason: inspected.reason };
   }
-  const present = inspected.kind === "ok" && inspected.config.projects.includes(options.project);
+  const entries = inspected.kind === "ok" ? inspected.config.projects : [];
+  const canonical = await Promise.all(entries.map(canonicalProject));
+  const present = canonical.some((entry) => entry === options.project);
   if (options.action === "allow" && present) {
     return {
       kind: "unchanged",
       configPath,
-      projects: inspected.kind === "ok" ? inspected.config.projects : [],
+      projects: entries,
       present: true
     };
   }
@@ -3402,13 +3704,12 @@ async function changeProjectConfig(options) {
     return {
       kind: "unchanged",
       configPath,
-      projects: inspected.kind === "ok" ? inspected.config.projects : [],
+      projects: entries,
       present: false
     };
   }
   const raw = inspected.kind === "ok" ? { ...inspected.raw } : { ...DEFAULT_CONFIG, projects: [] };
-  const current = inspected.kind === "ok" ? inspected.config.projects : [];
-  const projects = options.action === "allow" ? [...current, options.project] : current.filter((project) => project !== options.project);
+  const projects = options.action === "allow" ? [...entries, options.project] : entries.filter((_, index) => canonical[index] !== options.project);
   const configRealPath = inspected.kind === "ok" ? inspected.realPath : await canonicalConfigPath(configPath);
   const containing = await firstContainingProject(configRealPath, projects);
   if (containing !== undefined) {
@@ -3469,6 +3770,7 @@ async function isSelfTarget(callerPid, deps) {
 // packages/omp-extension/src/lifecycle.ts
 var RECORD_REFRESH_MS = 60000;
 var PROJECT_CONFIRM_TIMEOUT_MS = 60000;
+var MAX_SESSION_NAME_CHARS2 = 256;
 function sameModel(a, b) {
   if (a === undefined || b === undefined)
     return a === b;
@@ -3716,7 +4018,7 @@ class Host {
   async#requireMainTui(ctx, commandName) {
     if (this.#omp.isRootTui(ctx))
       return true;
-    this.#omp.notify(ctx, `AgentBridge: /agentbridge ${commandName} ch\u1EC9 d\xF9ng trong TUI ch\xEDnh; kh\xF4ng thay \u0111\u1ED5i config.`, "warning");
+    this.#omp.notify(ctx, HOST_TEXT.mainTuiOnly(commandName), "warning");
     return false;
   }
   async#currentProject(ctx) {
@@ -3734,17 +4036,16 @@ class Host {
     }
   }
   async#confirmProjectChange(ctx, action, project) {
-    const label = action === "allow" ? "Cho ph\xE9p" : "B\u1ECF cho ph\xE9p";
+    const label = HOST_TEXT.projectActionLabel(action);
     let answer;
     try {
-      answer = await this.#omp.select(ctx, `AgentBridge: /agentbridge ${action} \u2014 ${label} project?
-${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CONFIRM_TIMEOUT_MS });
+      answer = await this.#omp.select(ctx, HOST_TEXT.projectConfirmTitle(action, label, project), [HOST_TEXT.agree, HOST_TEXT.refuse], { timeout: PROJECT_CONFIRM_TIMEOUT_MS, initialIndex: 1 });
     } catch {
-      this.#omp.notify(ctx, "AgentBridge: kh\xF4ng m\u1EDF \u0111\u01B0\u1EE3c h\u1ED9p tho\u1EA1i x\xE1c nh\u1EADn; config kh\xF4ng thay \u0111\u1ED5i.", "warning");
+      this.#omp.notify(ctx, HOST_TEXT.confirmUnavailable, "warning");
       return false;
     }
-    if (answer !== "\u0110\u1ED3ng \xFD") {
-      this.#omp.notify(ctx, "AgentBridge: \u0111\xE3 hu\u1EF7; config kh\xF4ng thay \u0111\u1ED5i.", "info");
+    if (answer !== HOST_TEXT.agree) {
+      this.#omp.notify(ctx, HOST_TEXT.confirmCancelled, "info");
       return false;
     }
     return true;
@@ -3765,27 +4066,27 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
         homeDir: dirs.homeDir
       });
     } catch (error) {
-      this.#omp.notify(ctx, `AgentBridge: kh\xF4ng ghi \u0111\u01B0\u1EE3c config (${dirs.configFile}): ${errorMessage(error).slice(0, 200)}`, "warning");
+      this.#omp.notify(ctx, HOST_TEXT.configWriteFailed(dirs.configFile, errorMessage(error)), "warning");
       return;
     }
     switch (result.kind) {
       case "changed":
-        this.#omp.notify(ctx, action === "allow" ? `AgentBridge: \u0111\xE3 cho ph\xE9p project: ${project}` : `AgentBridge: \u0111\xE3 b\u1ECF cho ph\xE9p project: ${project}`, "info");
+        this.#omp.notify(ctx, action === "allow" ? HOST_TEXT.projectAllowed(project) : HOST_TEXT.projectDisallowed(project), "info");
         return;
       case "unchanged":
-        this.#omp.notify(ctx, result.present ? `AgentBridge: project \u0111\xE3 c\xF3 trong danh s\xE1ch: ${project}` : `AgentBridge: project kh\xF4ng c\xF3 trong danh s\xE1ch: ${project}`, "info");
+        this.#omp.notify(ctx, result.present ? HOST_TEXT.projectAlreadyListed(project) : HOST_TEXT.projectNotListed(project), "info");
         return;
       case "invalid":
-        this.#omp.notify(ctx, `AgentBridge: config kh\xF4ng h\u1EE3p l\u1EC7: ${result.configPath} (${result.reason}); kh\xF4ng ghi \u0111\xE8.`, "warning");
+        this.#omp.notify(ctx, HOST_TEXT.configInvalidNoWrite(result.configPath, result.reason), "warning");
         return;
       case "insecure":
-        this.#omp.notify(ctx, `AgentBridge: config kh\xF4ng an to\xE0n: ${result.configPath} (${result.reason}); kh\xF4ng ghi.`, "warning");
+        this.#omp.notify(ctx, HOST_TEXT.configInsecureNoWrite(result.configPath, result.reason), "warning");
         return;
       case "config_inside_project":
-        this.#omp.notify(ctx, `AgentBridge: t\u1EEB ch\u1ED1i ghi config v\xEC file n\u1EB1m trong project \u0111\u01B0\u1EE3c ph\xE9p (${result.project}); h\xE3y chuy\u1EC3n config ra ngo\xE0i project.`, "warning");
+        this.#omp.notify(ctx, HOST_TEXT.configInsideProject(result.project), "warning");
         return;
       case "write_failed":
-        this.#omp.notify(ctx, `AgentBridge: kh\xF4ng ghi \u0111\u01B0\u1EE3c config (${result.configPath}): ${result.reason.slice(0, 200)}`, "warning");
+        this.#omp.notify(ctx, HOST_TEXT.configWriteFailed(result.configPath, result.reason), "warning");
         return;
     }
   }
@@ -3797,30 +4098,29 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
     try {
       inspected = await inspectConfig(dirs.configFile, { requireSecureMode: false });
     } catch (error) {
-      this.#omp.notify(ctx, `AgentBridge: kh\xF4ng \u0111\u1ECDc \u0111\u01B0\u1EE3c config (${dirs.configFile}): ${errorMessage(error).slice(0, 200)}`, "warning");
+      this.#omp.notify(ctx, HOST_TEXT.configReadFailed(dirs.configFile, errorMessage(error)), "warning");
       return;
     }
     switch (inspected.kind) {
       case "missing":
         this.#omp.notify(ctx, [
-          `AgentBridge: config ch\u01B0a c\xF3 (d\xF9ng m\u1EB7c \u0111\u1ECBnh an to\xE0n): ${dirs.configFile}`,
-          "projects: (tr\u1ED1ng)",
+          HOST_TEXT.configMissingHeader(dirs.configFile),
+          HOST_TEXT.projectsLine([]),
           `chat.enabled: ${String(DEFAULT_CONFIG.chat.enabled)}`,
           `chat.autoApprove: ${DEFAULT_CONFIG.chat.autoApprove}`
         ].join(`
 `), "info");
         return;
       case "invalid":
-        this.#omp.notify(ctx, `AgentBridge: config kh\xF4ng h\u1EE3p l\u1EC7: ${dirs.configFile} (${inspected.reason}); kh\xF4ng ghi \u0111\xE8.`, "warning");
+        this.#omp.notify(ctx, HOST_TEXT.configInvalidNoWrite(dirs.configFile, inspected.reason), "warning");
         return;
       case "insecure":
-        this.#omp.notify(ctx, `AgentBridge: config kh\xF4ng an to\xE0n: ${dirs.configFile} (${inspected.reason})`, "warning");
+        this.#omp.notify(ctx, HOST_TEXT.configInsecure(dirs.configFile, inspected.reason), "warning");
         return;
       case "ok": {
-        const projects = inspected.config.projects.length === 0 ? "(tr\u1ED1ng)" : inspected.config.projects.join(", ");
         this.#omp.notify(ctx, [
-          `AgentBridge: config: ${dirs.configFile}`,
-          `projects: ${projects}`,
+          HOST_TEXT.configHeader(dirs.configFile),
+          HOST_TEXT.projectsLine(inspected.config.projects),
           `chat.enabled: ${String(inspected.config.chat.enabled)}`,
           `chat.autoApprove: ${inspected.config.chat.autoApprove}`
         ].join(`
@@ -3839,19 +4139,19 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
         return;
       case "trust":
         this.#trusted = true;
-        this.#omp.notify(ctx, "AgentBridge: \u0111\xE3 tin phi\xEAn n\xE0y (ch\u1EC9 trong b\u1ED9 nh\u1EDB).", "info");
+        this.#omp.notify(ctx, HOST_TEXT.trusted, "info");
         return;
       case "untrust":
         this.#trusted = false;
-        this.#omp.notify(ctx, "AgentBridge: \u0111\xE3 b\u1ECF tin c\u1EADy phi\xEAn n\xE0y.", "info");
+        this.#omp.notify(ctx, HOST_TEXT.untrusted, "info");
         return;
       case "off":
         await this.pause(ctx);
-        this.#omp.notify(ctx, "AgentBridge: \u0111\xE3 t\u1EAFt server cho phi\xEAn n\xE0y.", "info");
+        this.#omp.notify(ctx, HOST_TEXT.serverOff, "info");
         return;
       case "on":
         await this.resume(ctx);
-        this.#omp.notify(ctx, "AgentBridge: \u0111\xE3 b\u1EADt l\u1EA1i server cho phi\xEAn n\xE0y.", "info");
+        this.#omp.notify(ctx, HOST_TEXT.serverOn, "info");
         return;
       case "allow":
       case "disallow":
@@ -3863,11 +4163,11 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
       case "autochat": {
         const requested = (parts[1] ?? "").toLowerCase();
         if (requested.length === 0) {
-          this.#omp.notify(ctx, `AgentBridge: autochat ${this.#auto.mode} (${autoSourceLabel(this.#auto.source)}). D\xF9ng /agentbridge autochat off|limited [ph\xFAt]|unlimited.`, "info");
+          this.#omp.notify(ctx, HOST_TEXT.autochatState(this.#auto.mode, autoSourceLabel(this.#auto.source)), "info");
           return;
         }
         if (!isAutoApproveMode2(requested)) {
-          this.#omp.notify(ctx, "AgentBridge: d\xF9ng /agentbridge autochat off|limited [ph\xFAt]|unlimited.", "warning");
+          this.#omp.notify(ctx, HOST_TEXT.autochatUsage, "warning");
           return;
         }
         if (requested === "off") {
@@ -3875,7 +4175,7 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
           this.#startAutoLimitTimer(ctx, undefined);
           this.#auto.configure("off", "tui");
           this.#refreshBridgeStatus(ctx);
-          this.#omp.notify(ctx, "AgentBridge: autochat \u0111\xE3 t\u1EAFt cho phi\xEAn n\xE0y.", "info");
+          this.#omp.notify(ctx, HOST_TEXT.autochatOff, "info");
           return;
         }
         if (requested === "unlimited") {
@@ -3883,7 +4183,7 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
           this.#startAutoLimitTimer(ctx, undefined);
           this.#auto.configure("unlimited", "tui");
           this.#refreshBridgeStatus(ctx);
-          this.#omp.notify(ctx, "AgentBridge: autochat unlimited b\u1EADt t\u1EEB l\u1EC7nh TUI.", "info");
+          this.#omp.notify(ctx, HOST_TEXT.autochatUnlimitedTui, "info");
           this.#notifyUnlimited(ctx);
           return;
         }
@@ -3892,13 +4192,13 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
         if (rawMinutes !== undefined) {
           const parsed = rawMinutes.match(/^\d+$/) === null ? Number.NaN : Number(rawMinutes);
           if (!Number.isInteger(parsed) || parsed <= 0) {
-            this.#omp.notify(ctx, "AgentBridge: s\u1ED1 ph\xFAt ph\u1EA3i l\xE0 s\u1ED1 nguy\xEAn d\u01B0\u01A1ng (t\u1ED1i \u0111a 480).", "warning");
+            this.#omp.notify(ctx, HOST_TEXT.autochatBadMinutes, "warning");
             return;
           }
           minutes = parsed;
           if (minutes > AUTOCHAT_LIMITED_MAX_MINUTES) {
             minutes = AUTOCHAT_LIMITED_MAX_MINUTES;
-            this.#omp.notify(ctx, `AgentBridge: th\u1EDDi h\u1EA1n autochat t\u1ED1i \u0111a ${AUTOCHAT_LIMITED_MAX_MINUTES} ph\xFAt; \u0111\xE3 k\u1EB9p v\u1EC1 ${AUTOCHAT_LIMITED_MAX_MINUTES}.`, "warning");
+            this.#omp.notify(ctx, HOST_TEXT.autochatMinutesClamped(AUTOCHAT_LIMITED_MAX_MINUTES), "warning");
           }
         }
         const config = await loadConfig(resolveDirs().configFile, { fresh: true });
@@ -3907,15 +4207,15 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
         this.#auto.configure("limited", "tui", { limits, resetQuota: true });
         this.#startAutoLimitTimer(ctx, minutes);
         this.#refreshBridgeStatus(ctx);
-        this.#omp.notify(ctx, minutes === undefined ? "AgentBridge: autochat limited b\u1EADt t\u1EEB l\u1EC7nh TUI." : `AgentBridge: autochat limited b\u1EADt t\u1EEB l\u1EC7nh TUI trong ${minutes} ph\xFAt.`, "info");
+        this.#omp.notify(ctx, HOST_TEXT.autochatLimitedTui(minutes), "info");
         return;
       }
       case "clear":
         this.#consult.clearWidget(ctx);
-        this.#omp.notify(ctx, "AgentBridge: \u0111\xE3 xo\xE1 widget.", "info");
+        this.#omp.notify(ctx, HOST_TEXT.widgetCleared, "info");
         return;
       default:
-        this.#omp.notify(ctx, "AgentBridge: d\xF9ng /agentbridge [status|trust|untrust|autochat|off|on|clear|allow|disallow|config].", "warning");
+        this.#omp.notify(ctx, HOST_TEXT.commandUsage, "warning");
     }
   }
   async heartbeat() {
@@ -3957,7 +4257,7 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
     if (this.#warned)
       return;
     this.#warned = true;
-    this.#omp.notify(ctx, `AgentBridge l\u1ED7i: ${errorMessage(error).slice(0, 300)}`, "warning");
+    this.#omp.notify(ctx, HOST_TEXT.error(errorMessage(error)), "warning");
   }
   fail(ctx, error) {
     this.notifyError(ctx, error);
@@ -3986,19 +4286,18 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
     const config = await loadConfig();
     const allowed = projectAllowed(config.projects, active?.git?.worktree ?? cwd);
     const status = active?.status ?? (this.#enabled ? "offline" : "off");
-    const trust = this.#trusted ? " (trusted trong phi\xEAn)" : "";
     const auto = this.#auto;
-    const autoText = auto.mode === "off" ? "off" : auto.mode === "limited" ? `limited ${auto.used}/${auto.quota ?? 0} (${autoSourceLabel(auto.source)})` : `unlimited \u221E \xB7 ${auto.used} tin (${autoSourceLabel(auto.source)})`;
-    const lines = [
-      "AgentBridge",
-      `endpoint: ${active?.endpoint ?? "(ch\u01B0a c\xF4ng b\u1ED1)"}`,
-      `session: ${sessionId}`,
-      `tr\u1EA1ng th\xE1i: ${status}`,
-      `project: ${allowed ? "\u0111\u01B0\u1EE3c ph\xE9p" : "kh\xF4ng \u0111\u01B0\u1EE3c ph\xE9p"}`,
-      `consent: ${config.consult.consent}${trust}`,
-      `autochat: ${autoText}`,
-      `request: ${active?.requests ?? 0}`
-    ];
+    const autoText = auto.mode === "off" ? "off" : auto.mode === "limited" ? HOST_TEXT.autochatLimitedState(auto.used, auto.quota ?? 0, autoSourceLabel(auto.source)) : HOST_TEXT.autochatUnlimitedState(auto.used, autoSourceLabel(auto.source));
+    const lines = HOST_TEXT.statusLines({
+      endpoint: active?.endpoint,
+      sessionId,
+      status,
+      projectAllowed: allowed,
+      consent: config.consult.consent,
+      trusted: this.#trusted,
+      autochat: autoText,
+      requests: active?.requests ?? 0
+    });
     this.#omp.notify(ctx, lines.join(`
 `), "info");
   }
@@ -4015,7 +4314,7 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
     }
   }
   #setBridgeStatus(active) {
-    const base = active.capabilities.includes("consult") || active.capabilities.includes("chat") ? "\uD83D\uDD17 bridge" : "\uD83D\uDD17 bridge (status-only)";
+    const base = HOST_TEXT.statusBar(active.capabilities.includes("consult") || active.capabilities.includes("chat"));
     this.#omp.setStatus(active.ctx, bridgeStatusText(base, this.#auto, active.capabilities.includes("chat")));
   }
   #refreshBridgeStatus(ctx) {
@@ -4053,7 +4352,7 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
           this.#auto.configure("off", "tui");
           const target = this.#active?.ctx ?? ctx;
           this.#refreshBridgeStatus(target);
-          this.#omp.notify(target, "AgentBridge: autochat limited \u0111\xE3 h\u1EBFt h\u1EA1n.", "info");
+          this.#omp.notify(target, HOST_TEXT.autochatExpired, "info");
         } catch (error) {
           this.notifyError(ctx, error);
         }
@@ -4089,7 +4388,7 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
       if (this.#autoTuiMode !== undefined) {
         this.#auto.configure(this.#autoTuiMode, "tui");
         if (this.#autoTuiMode !== "off") {
-          this.#omp.notify(ctx, `AgentBridge: autochat ${this.#autoTuiMode} b\u1EADt t\u1EEB l\u1EC7nh TUI.`, "info");
+          this.#omp.notify(ctx, HOST_TEXT.autochatModeTui(this.#autoTuiMode), "info");
         }
         return;
       }
@@ -4110,14 +4409,14 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
           this.#auto.configure(flag.mode, "cli");
         }
         if (flag.mode !== "off") {
-          this.#omp.notify(ctx, `AgentBridge: autochat ${flag.mode} b\u1EADt t\u1EEB CLI (--${AUTOCHAT_FLAG}).`, "info");
+          this.#omp.notify(ctx, HOST_TEXT.autochatModeCli(flag.mode, AUTOCHAT_FLAG), "info");
         }
         if (flag.mode === "unlimited")
           this.#notifyUnlimited(ctx);
         return;
       }
       if (flag.present && flag.invalid !== undefined) {
-        this.#omp.notify(ctx, `AgentBridge: b\u1ECF qua c\u1EDD --${AUTOCHAT_FLAG} kh\xF4ng h\u1EE3p l\u1EC7 (${flag.invalid}).`, "warning");
+        this.#omp.notify(ctx, HOST_TEXT.autochatBadFlag(AUTOCHAT_FLAG, flag.invalid), "warning");
       }
       const config = await loadConfig(dirs.configFile, { fresh: true });
       if (config.chat.autoApprove === "off") {
@@ -4162,7 +4461,7 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
         return;
       }
       this.#auto.configure("off", "config");
-      this.#omp.notify(ctx, `AgentBridge: b\u1ECF qua chat.autoApprove v\xEC kh\xF4ng ki\u1EC3m tra \u0111\u01B0\u1EE3c config (${errorMessage(error).slice(0, 160)}).`, "warning");
+      this.#omp.notify(ctx, HOST_TEXT.autochatConfigUnchecked(errorMessage(error)), "warning");
     }
   }
   #setStatus(ctx, status) {
@@ -4220,8 +4519,9 @@ ${project}`, ["\u0110\u1ED3ng \xFD", "T\u1EEB ch\u1ED1i"], { timeout: PROJECT_CO
       requests: 0
     };
     const sessionName = omp.getSessionName();
-    if (sessionName !== undefined)
-      active.sessionName = sessionName;
+    if (typeof sessionName === "string" && sessionName.length > 0) {
+      active.sessionName = sessionName.slice(0, MAX_SESSION_NAME_CHARS2);
+    }
     if (git !== undefined)
       active.git = git;
     active.model = omp.model(ctx);
@@ -4469,7 +4769,7 @@ function agentbridgeExtension(pi) {
   const host = new Host(createOmpLike(pi, EXTENSION_VERSION));
   try {
     pi.registerFlag?.(AUTOCHAT_FLAG, {
-      description: "AgentBridge autochat: off | limited | unlimited (TUI command overrides this; config is the fallback)",
+      description: EXTENSION_TEXT.autochatFlag,
       type: "string"
     });
   } catch {}
@@ -4546,7 +4846,7 @@ function agentbridgeExtension(pi) {
     }
   });
   pi.registerCommand("agentbridge", {
-    description: "AgentBridge: status, trust, untrust, autochat, allow, disallow, config, off, on, clear",
+    description: EXTENSION_TEXT.command,
     getArgumentCompletions: agentbridgeArgumentCompletions,
     handler: async (args, ctx) => {
       try {
