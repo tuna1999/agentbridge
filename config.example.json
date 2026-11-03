@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "projects": ["/home/you/projects/my-app"],
+  "allowFrom": ["claude-code"],
+  "consult": {
+    "consent": "ask",
+    "consentTimeoutMs": 60000,
+    "maxQuestionBytes": 32768,
+    "maxAttachmentBytes": 65536,
+    "maxContextBytes": 1048576,
+    "replyMaxBytes": 32768,
+    "maxTokens": 4096,
+    "allowUncapped": false,
+    "ratePerMinute": 6,
+    "toolsOff": true
+  },
+  "chat": {
+    "enabled": false,
+    "queueWhenBusy": false,
+    "consentTimeoutMs": 120000,
+    "autoApprove": "off",
+    "autoMaxChars": 2000,
+    "autoMaxMessages": 20,
+    "autoMinIntervalMs": 10000
+  },
+  "audit": { "content": false, "maxBytes": 5242880 },
+  "ui": { "liveWidget": true, "widgetLines": 6, "widgetHoldMs": 20000 }
+}

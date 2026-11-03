@@ -95,7 +95,7 @@ Các giá trị XDG (`XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`) **k
 
 Plugin install **không tự tạo** file config. Chạy `/agentbridge allow` trong main OMP TUI để tạo file từ mẫu mặc định và thêm project; nếu không, AgentBridge dùng mặc định an toàn (`projects: []`) và consult sẽ trả `project_not_allowed`. Có thể tạo/sửa `~/.agentbridge/config.json` thủ công (thư mục `~/.agentbridge` nên `0700`, file `0600`). Dev installer cũng tạo file này nếu chưa tồn tại.
 
-Config mẫu (giá trị mặc định):
+Config mẫu (giá trị mặc định; có sẵn file [`config.example.json`](config.example.json) để copy, nhớ sửa `projects` thành `realpath` project của bạn):
 
 ```json
 {

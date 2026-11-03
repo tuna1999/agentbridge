@@ -269,3 +269,11 @@ test("realpaths projects, drops missing ones, and warns once", async () => {
 	}
 	expect(warnings).toBe(1);
 });
+
+test("config.example.json at repo root is valid and matches defaults except projects", async () => {
+	const examplePath = join(import.meta.dir, "../../../config.example.json");
+	const result = await readConfigStrict(examplePath);
+	if (result.kind !== "ok") throw new Error(`config.example.json: ${result.kind}`);
+	expect(result.config.projects.length).toBeGreaterThan(0);
+	expect({ ...result.config, projects: [] as string[] }).toEqual(DEFAULT_CONFIG);
+});
