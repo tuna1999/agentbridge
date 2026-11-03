@@ -3,8 +3,8 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CliIO, parseCommand, parseFileSpec, parseInstalledPluginsJson, parseOmpPluginPackage, parsePluginListJson, runCli } from "./cli";
-import { createFakeHost, DEFAULT_REPLY, type FakeHost, type FakeHostOptions } from "./test-helpers";
+import { type CliIO, parseCommand, parseFileSpec, parseInstalledPluginsJson, parseOmpPluginPackage, runCli } from "./cli";
+import { createFakeHost, DEFAULT_REPLY, type FakeHost, type FakeHostOptions, fakeConsultResult } from "./test-helpers";
 
 const SESSION_ID = "0199ab12-0000-7000-8000-000000000021";
 const INSTANCE_ID = "0199ab12-1111-7000-8000-000000000021";
@@ -20,6 +20,10 @@ const ENV_KEYS = [
 	"XDG_CONFIG_HOME",
 	"XDG_STATE_HOME",
 	"XDG_RUNTIME_DIR",
+	"PI_CODING_AGENT_DIR",
+	"PI_CONFIG_DIR",
+	"OMP_PROFILE",
+	"PI_PROFILE",
 ] as const;
 
 let root: string;
@@ -46,6 +50,10 @@ beforeEach(async () => {
 	delete process.env.XDG_CONFIG_HOME;
 	delete process.env.XDG_STATE_HOME;
 	delete process.env.XDG_RUNTIME_DIR;
+	delete process.env.PI_CODING_AGENT_DIR;
+	delete process.env.PI_CONFIG_DIR;
+	delete process.env.OMP_PROFILE;
+	delete process.env.PI_PROFILE;
 
 	// Never invoke the real Claude CLI from tests: it can write migration
 	// backups under the temp HOME while listing plugins.
@@ -208,8 +216,29 @@ describe("parseCommand", () => {
 
 	test("rejects unknown flags and missing values", () => {
 		expect(() => parseCommand(["--bogus"])).toThrow("Tham số không hỗ trợ: --bogus");
+		expect(() => parseCommand(["-x"])).toThrow("Tham số không hỗ trợ: -x");
 		expect(() => parseCommand(["--file"])).toThrow("Thiếu giá trị cho --file");
 		expect(() => parseCommand(["--target"])).toThrow("Thiếu giá trị cho --target");
+		expect(() => parseCommand(["--scope", "--json"])).toThrow("Thiếu giá trị cho --scope");
+		expect(() => parseCommand(["--target="])).toThrow("Thiếu giá trị cho --target");
+	});
+
+	test("accepts --flag=value, -- and help anywhere", () => {
+		const parsed = parseCommand(["--scope=all", "--file=-odd.txt", "--", "--not-a-flag", "-h"]);
+		expect(parsed.flags.get("--scope")).toEqual(["all"]);
+		expect(parsed.flags.get("--file")).toEqual(["-odd.txt"]);
+		expect(parsed.positional).toEqual(["--not-a-flag", "-h"]);
+		expect(parsed.help).toBe(false);
+		expect(parseCommand(["q", "-h"]).help).toBe(true);
+		expect(parseCommand(["-"]).positional).toEqual(["-"]);
+	});
+
+	test("prose that starts with a dash is text, not a flag", () => {
+		expect(parseCommand(["- liệt kê các bước"]).positional).toEqual(["- liệt kê các bước"]);
+		expect(parseCommand(["-5 độ là bao nhiêu?"]).positional).toEqual(["-5 độ là bao nhiêu?"]);
+		expect(parseCommand(["--file", "-my notes.txt"]).flags.get("--file")).toEqual(["-my notes.txt"]);
+		expect(() => parseCommand(["--target", "-abc"])).toThrow("Thiếu giá trị cho --target");
+		expect(() => parseCommand(["--target", "--", "-x"])).toThrow("Thiếu giá trị cho --target");
 	});
 });
 
@@ -222,7 +251,7 @@ describe("runCli argument errors", () => {
 		expect(captured.stderr()).toContain("Tham số không hỗ trợ: --bogus");
 	});
 
-	test("invalid command arguments fail without IPC", async () => {
+	test("invalid command arguments are usage errors (exit 2) and never touch IPC", async () => {
 		const cases: Array<{ argv: string[]; expected: string }> = [
 			{ argv: ["list", "extra"], expected: "ab list không nhận tham số vị trí" },
 			{ argv: ["status", "one", "two"], expected: "ab status nhận tối đa một target" },
@@ -230,14 +259,26 @@ describe("runCli argument errors", () => {
 			{ argv: ["chat"], expected: "ab chat cần tin nhắn" },
 			{ argv: ["consult", "q", "--target", "a", "--target", "b"], expected: "--target chỉ được dùng một lần" },
 			{ argv: ["list", "--scope", "galaxy"], expected: "--scope phải là worktree, repo hoặc all" },
+			{ argv: ["chat", "hi", "--file", "secret-notes.txt"], expected: "ab chat không nhận --file" },
+			{ argv: ["consult", "q", "--json"], expected: "ab consult không nhận --json" },
+			{ argv: ["status", "--scope", "all"], expected: "ab status không nhận --scope" },
+			{ argv: ["status", "a", "--target", "b"], expected: "Chỉ dùng một trong hai" },
+			{ argv: ["doctor", "--json"], expected: "ab doctor không nhận --json" },
 		];
 
 		for (const item of cases) {
 			const captured = capture(projectDir);
 			const code = await runCli(item.argv, captured.io);
-			expect(code).toBe(1);
+			expect(code).toBe(2);
 			expect(captured.stderr()).toContain(item.expected);
+			expect(captured.stderr()).not.toContain("Lỗi nội bộ");
 		}
+	});
+
+	test("help after a subcommand prints usage", async () => {
+		const captured = capture(projectDir);
+		expect(await runCli(["consult", "--help"], captured.io)).toBe(0);
+		expect(captured.stdout()).toContain("Dùng: ab");
 	});
 });
 
@@ -268,6 +309,59 @@ describe("runCli with a fake host", () => {
 			expect(captured.stdout()).toContain("Trạng thái phiên OMP");
 			expect(captured.stdout()).toContain(`- Session: ${SESSION_ID}`);
 			expect(captured.stdout()).toContain("- Consent: ask");
+		} finally {
+			await fake.close();
+		}
+	});
+
+	test("ab status --target is honored instead of auto-selecting another session", async () => {
+		const fake = await host();
+		try {
+			const captured = capture(projectDir);
+			const code = await runCli(["status", "--target", "0199ab12-ffff-7000-8000-00000000dead"], captured.io);
+			expect(code).toBe(1);
+			expect(captured.stderr()).toContain("target_not_found");
+			expect(captured.stdout()).not.toContain(SESSION_ID);
+		} finally {
+			await fake.close();
+		}
+	});
+
+	test("ab consult streaming prints the unterminated last line and one-line replies", async () => {
+		for (const { deltas, reply } of [
+			{ deltas: ["Line one.\n"], reply: "Line one.\nLine two (final)" },
+			{ deltas: [], reply: "4" },
+		]) {
+			const fake = await host({
+				onConsult: async (env, io) => {
+					for (const delta of deltas) {
+						io.send({ v: 1, id: crypto.randomUUID(), type: "progress", replyTo: env.id, from: { agent: "omp", sessionId: SESSION_ID }, ts: Date.now(), hop: 0, body: { phase: "delta", delta } });
+					}
+					io.send({ v: 1, id: crypto.randomUUID(), type: "result", replyTo: env.id, from: { agent: "omp", sessionId: SESSION_ID }, ts: Date.now(), hop: 0, body: fakeConsultResult(reply) });
+				},
+			});
+			try {
+				const captured = capture(projectDir);
+				const code = await runCli(["consult", "q?", "--target", SESSION_ID], captured.io);
+				expect(code).toBe(0);
+				expect(captured.stdout().startsWith(`${reply}\n[AgentBridge] Phản hồi từ OMP`)).toBe(true);
+			} finally {
+				await fake.close();
+			}
+		}
+	});
+
+	test("ab consult strips terminal escapes from model output", async () => {
+		const fake = await host({
+			onConsult: async (env, io) => {
+				io.send({ v: 1, id: crypto.randomUUID(), type: "result", replyTo: env.id, from: { agent: "omp", sessionId: SESSION_ID }, ts: Date.now(), hop: 0, body: fakeConsultResult("ok\x1b]52;c;ZXZpbA==\x07 done") });
+			},
+		});
+		try {
+			const captured = capture(projectDir);
+			expect(await runCli(["consult", "q?", "--target", SESSION_ID], captured.io)).toBe(0);
+			expect(captured.stdout()).not.toContain("\x1b");
+			expect(captured.stdout()).toContain("ok done\n");
 		} finally {
 			await fake.close();
 		}
@@ -357,29 +451,6 @@ describe("plugin state parsers", () => {
 		expect(records?.[2]?.enabled).toBe(false);
 		expect(parseInstalledPluginsJson("not json")).toBeUndefined();
 		expect(parseInstalledPluginsJson(JSON.stringify({ plugins: {} }))).toBeUndefined();
-	});
-
-	test("parses claude plugin list JSON including inline MCP server names", () => {
-		const records = parsePluginListJson(
-			JSON.stringify([
-				{
-					id: "agentbridge@agentbridge",
-					version: "1.0.0",
-					scope: "user",
-					enabled: true,
-					installPath: "/cache/plugin",
-					mcpServers: { agentbridge: { type: "stdio", command: "bun" } },
-				},
-			]),
-		);
-		expect(records).toHaveLength(1);
-		expect(records?.[0]).toMatchObject({
-			id: "agentbridge@agentbridge",
-			name: "agentbridge",
-			mcpServers: ["agentbridge"],
-			enabled: true,
-		});
-		expect(parsePluginListJson("{}")).toBeUndefined();
 	});
 
 	test("parses OMP package.json omp/pi manifests", () => {
@@ -593,28 +664,77 @@ describe("ab doctor", () => {
 		expect(captured.stdout()).toContain("claude plugin uninstall agentbridge@agentbridge");
 	});
 
-	test("falls back to claude plugin list --json when the registry is absent", async () => {
+	test("never spawns claude and reports an unreadable plugin registry", async () => {
+		const marker = join(root, "claude-was-called");
 		const fakeClaude = join(root, "fake-bin", "claude");
-		await writeFile(
-			fakeClaude,
-			`#!/bin/sh
-if [ "$1" = "plugin" ] && [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-  printf '%s\\n' '[{"id":"agentbridge@agentbridge","version":"1.0.0","scope":"user","enabled":true,"installPath":"/fake/cache","mcpServers":{"agentbridge":{"command":"bun"}}}]'
-  exit 0
-fi
-exit 1
-`,
-			{ mode: 0o755 },
-		);
+		await writeFile(fakeClaude, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
 		await chmod(fakeClaude, 0o755);
+		await mkdir(join(homeDir, ".claude", "plugins"), { recursive: true });
+		await writeFile(join(homeDir, ".claude", "plugins", "installed_plugins.json"), "{not json");
 
 		const captured = capture(projectDir);
 		const code = await runCli(["doctor"], captured.io);
 
 		expect(code).toBe(0);
-		expect(captured.stdout()).toContain("[ok] Claude plugin AgentBridge");
-		expect(captured.stdout()).toContain("agentbridge@agentbridge");
-		expect(captured.stdout()).toContain("[ok] MCP agentbridge");
+		expect(existsSync(marker)).toBe(false);
+		expect(captured.stdout()).toContain("[warn] Claude plugin AgentBridge");
+		expect(captured.stdout()).toContain("installed_plugins.json");
+	});
+
+	test("fails an invalid config instead of reporting the loader's safe defaults as ok", async () => {
+		const configFile = join(root, "bad-config.json");
+		process.env.AGENTBRIDGE_CONFIG = configFile;
+		await writeFile(configFile, JSON.stringify({ version: 1, projects: "/not/an/array" }), { mode: 0o600 });
+
+		const captured = capture(projectDir);
+		const code = await runCli(["doctor"], captured.io);
+
+		expect(code).toBe(1);
+		expect(captured.stdout()).toContain("[fail] config");
+		expect(captured.stdout()).toContain("invalid projects");
+		expect(captured.stdout()).not.toContain("[ok] config");
+	});
+
+	test("warns about relative, missing and loosely permitted project config", async () => {
+		const configFile = join(root, "loose-config.json");
+		process.env.AGENTBRIDGE_CONFIG = configFile;
+		await writeFile(configFile, JSON.stringify({ version: 1, projects: [".", join(root, "gone"), projectDir] }), { mode: 0o644 });
+		await chmod(configFile, 0o644);
+
+		const captured = capture(projectDir);
+		expect(await runCli(["doctor"], captured.io)).toBe(0);
+		expect(captured.stdout()).toContain("[ok] config — 1 project được phép");
+		expect(captured.stdout()).toContain("không phải đường dẫn tuyệt đối: .");
+		expect(captured.stdout()).toContain(`không tồn tại: ${join(root, "gone")}`);
+		expect(captured.stdout()).toContain("[warn] config permissions");
+	});
+
+	test("warns about a read-only 0400 config the host would refuse for autochat and allow", async () => {
+		const configFile = join(root, "ro-config.json");
+		process.env.AGENTBRIDGE_CONFIG = configFile;
+		await writeFile(configFile, JSON.stringify({ version: 1, projects: [projectDir] }), { mode: 0o600 });
+		await chmod(configFile, 0o400);
+
+		const captured = capture(projectDir);
+		expect(await runCli(["doctor"], captured.io)).toBe(0);
+		expect(captured.stdout()).toContain("[warn] config permissions");
+	});
+
+	test("fails an insecure AgentBridge home or socket dir like the host would", async () => {
+		const abHome = join(root, "ab-home-loose");
+		process.env.AGENTBRIDGE_HOME = abHome;
+		delete process.env.AGENTBRIDGE_RUNTIME_DIR;
+		await mkdir(join(abHome, "run", "sessions"), { recursive: true, mode: 0o700 });
+		await mkdir(join(abHome, "run", "s"), { recursive: true });
+		await chmod(abHome, 0o755);
+		await chmod(join(abHome, "run"), 0o700);
+		await chmod(join(abHome, "run", "s"), 0o777);
+
+		const captured = capture(projectDir);
+		expect(await runCli(["doctor"], captured.io)).toBe(1);
+		expect(captured.stdout()).toContain("[fail] home dir");
+		expect(captured.stdout()).toContain("[fail] socket dir");
+		expect(captured.stdout()).toContain("[ok] runtime dir");
 	});
 
 	test("warns when an OMP plugin is disabled", async () => {

@@ -16,7 +16,7 @@ import {
 	type Scope,
 	statusOf,
 } from "./client";
-import { failureFrom, formatFailure } from "./errors";
+import { BridgeError, failureFrom, formatFailure } from "./errors";
 import {
 	formatChatResult,
 	formatConsultResult,
@@ -151,7 +151,8 @@ export function createToolHandlers(deps: ToolDependencies = {}): {
 	async function caller(): Promise<CallerContext> {
 		const identity = await identityResolver();
 		if (identity === undefined) {
-			throw new ProtocolError("denied", "[AgentBridge] unsupported_caller", { reason: "unsupported_caller" });
+			// Not `denied`: that code tells the model the user refused in OMP.
+			throw new BridgeError("unsupported_caller", MCP_MESSAGES.unsupportedCaller, MCP_MESSAGES.unsupportedCallerHint);
 		}
 		return callerFromIdentity(identity);
 	}

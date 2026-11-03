@@ -188,22 +188,22 @@ export function resolveTarget(caller: CallerContext, views: SessionView[], targe
 				"no_target",
 				options.length > 0 ? MCP_MESSAGES.noTargetWithOptions : MCP_MESSAGES.noTarget,
 				options.length > 0
-					? "Hỏi người dùng có muốn tham vấn một phiên trong danh sách dưới đây không; nếu có, gọi lại với `target`."
-					: "Mở `omp` trong cùng worktree, kiểm tra status bar có `🔗 bridge`, rồi thử lại nếu người dùng đồng ý.",
+					? MCP_MESSAGES.noTargetWithOptionsHint
+					: MCP_MESSAGES.noTargetHint,
 				options,
 			);
 		case "ambiguous_target":
 			throw new BridgeError(
 				"ambiguous_target",
 				MCP_MESSAGES.ambiguousTarget,
-				"Hỏi người dùng chọn sessionId trong danh sách bên dưới rồi gọi lại với `target`.",
+				MCP_MESSAGES.ambiguousTargetHint,
 				options,
 			);
 		case "cross_project":
 			throw new BridgeError(
 				"cross_project",
 				MCP_MESSAGES.crossProject,
-				"Hỏi người dùng có muốn mở OMP trong cùng project không. MVP không tự vượt project.",
+				MCP_MESSAGES.crossProjectHint,
 				options,
 			);
 		case "target_not_found": {
@@ -212,8 +212,8 @@ export function resolveTarget(caller: CallerContext, views: SessionView[], targe
 				"target_not_found",
 				unresponsive ? MCP_MESSAGES.targetUnresponsive : MCP_MESSAGES.targetNotFound,
 				unresponsive
-					? "Phiên có thể đang treo hoặc vừa đóng. Chạy agent_list để kiểm tra; không tự động thử lại."
-					: "Chạy agent_list để xem sessionId/tên phiên hiện có, rồi hỏi người dùng nếu chưa rõ.",
+					? MCP_MESSAGES.targetUnresponsiveHint
+					: MCP_MESSAGES.targetNotFoundHint,
 				options,
 			);
 		}
@@ -227,8 +227,8 @@ async function tokenFor(record: SessionRecord): Promise<string> {
 		const detail = error instanceof Error ? error.message : String(error);
 		throw new BridgeError(
 			"identity",
-			"Không đọc được token của phiên OMP.",
-			"Chạy agent_list để kiểm tra phiên còn sống; phiên có thể đã đóng hoặc file token không an toàn.",
+			MCP_MESSAGES.tokenUnreadable,
+			MCP_MESSAGES.tokenUnreadableHint,
 			undefined,
 			detail,
 		);
@@ -354,7 +354,7 @@ function sliceLines(text: string, path: string, startLine?: number, endLine?: nu
 			MCP_MESSAGES.badLines,
 			MCP_MESSAGES.badLinesHint,
 			undefined,
-			`${path}: start_line=${first} vượt quá ${lines.length} dòng`,
+			MCP_MESSAGES.badLinesBeyondEnd(path, first, lines.length),
 		);
 	}
 	const effectiveEnd = Math.min(last, lines.length);
@@ -375,8 +375,8 @@ export async function readIncludeFiles(
 	if (files.length > MAX_INCLUDE_FILES) {
 		throw new BridgeError(
 			"bad_request",
-			`Chỉ được đính kèm tối đa ${MAX_INCLUDE_FILES} file.`,
-			"Giảm số phần tử include_files.",
+			MCP_MESSAGES.tooManyIncludes(MAX_INCLUDE_FILES),
+			MCP_MESSAGES.tooManyIncludesHint,
 		);
 	}
 
@@ -408,7 +408,7 @@ export async function readIncludeFiles(
 			const detail = error instanceof Error ? error.message : String(error);
 			throw new BridgeError(
 				"path_blocked",
-				"Không đọc được file đính kèm.",
+				MCP_MESSAGES.includeUnreadable,
 				MCP_MESSAGES.pathBlockedHint,
 				undefined,
 				`${file.path}: ${detail}`,
@@ -431,7 +431,7 @@ export async function readIncludeFiles(
 			const detail = error instanceof Error ? error.message : String(error);
 			throw new BridgeError(
 				"path_blocked",
-				"Không đọc được file đính kèm.",
+				MCP_MESSAGES.includeUnreadable,
 				MCP_MESSAGES.pathBlockedHint,
 				undefined,
 				`${file.path}: ${detail}`,

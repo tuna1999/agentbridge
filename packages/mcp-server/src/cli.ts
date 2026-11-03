@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 /** Debug CLI `ab`. Spec: 01 §8.5. Never writes stdout for the MCP server; this is a human tool. */
 import { existsSync } from "node:fs";
-import { readdir, readFile, realpath } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { assertSecureDir, gitInfo, loadConfig, resolveDirs, sweepStale } from "@agentbridge/core";
-import { isRecord } from "@agentbridge/protocol";
+import { isAbsolute, join, resolve } from "node:path";
+import { assertSecureDir, gitInfo, readConfigStrict, resolveDirs, sweepStale } from "@agentbridge/core";
+import { isRecord, sanitizeText } from "@agentbridge/protocol";
 import {
 	type CallerContext,
 	chatTarget,
@@ -27,7 +27,7 @@ import {
 	formatStatus,
 	sessionJson,
 } from "./format";
-import { CLI_USAGE, MCP_MESSAGES } from "./messages";
+import { CLI_MESSAGES, CLI_USAGE, MCP_MESSAGES } from "./messages";
 
 export interface CliIO {
 	stdout(text: string): void;
@@ -35,7 +35,7 @@ export interface CliIO {
 	cwd: string;
 }
 
-function defaultIO(): CliIO {
+function defaultIO(cwd?: string): CliIO {
 	return {
 		stdout: (text) => {
 			process.stdout.write(text);
@@ -43,9 +43,12 @@ function defaultIO(): CliIO {
 		stderr: (text) => {
 			process.stderr.write(text);
 		},
-		cwd: process.cwd(),
+		cwd: cwd ?? process.cwd(),
 	};
 }
+
+/** Consult/chat transport budget; matches the MCP tools' default `timeout_s`. */
+const CLI_TIMEOUT_MS = 600_000;
 
 function line(io: CliIO, text: string, stream: "stdout" | "stderr" = "stdout"): void {
 	io[stream](text.endsWith("\n") ? text : `${text}\n`);
@@ -54,7 +57,25 @@ function line(io: CliIO, text: string, stream: "stdout" | "stderr" = "stdout"): 
 /** `homedir()` caches at startup under Bun; HOME/USERPROFILE must win for `ab doctor` overrides. */
 function homeDirectory(): string {
 	const envHome = process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME;
-	return envHome ?? homedir();
+	// Same rule as core `resolveDirs`: an empty HOME is ignored.
+	return envHome !== undefined && envHome.length > 0 ? envHome : homedir();
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+	return value !== undefined && value.length > 0 ? value : undefined;
+}
+
+/** OMP 18.14: `path.join(homedir, PI_CONFIG_DIR || ".omp")` — always below home (mirrors scripts/install.ts). */
+function ompConfigRoot(home: string): string {
+	return join(home, nonEmpty(process.env.PI_CONFIG_DIR) ?? ".omp");
+}
+
+/** A profile selects `<root>/profiles/<name>/agent` and ignores `PI_CODING_AGENT_DIR`. */
+function ompAgentDir(home: string): string {
+	const profile = nonEmpty(process.env.OMP_PROFILE) ?? nonEmpty(process.env.PI_PROFILE);
+	if (profile !== undefined) return join(ompConfigRoot(home), "profiles", profile, "agent");
+	const agentDir = nonEmpty(process.env.PI_CODING_AGENT_DIR);
+	return agentDir !== undefined ? resolve(agentDir) : join(ompConfigRoot(home), "agent");
 }
 
 export interface LegacyXdgDir {
@@ -121,18 +142,44 @@ export function parseFileSpec(spec: string): IncludeFileInput {
 	return { path: spec };
 }
 
+/** A usage mistake: printed as-is with exit code 2, never reported as an internal error. */
+export class UsageError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "UsageError";
+	}
+}
+
 export interface ParsedCommand {
 	positional: string[];
 	flags: Map<string, string[]>;
 	noStream: boolean;
 	json: boolean;
+	help: boolean;
 }
 
+const VALUE_FLAGS: ReadonlySet<string> = new Set(["--scope", "--target", "--file"]);
+/** `-x`, `--name`, `--name=value`. Prose such as "- liệt kê" or "-5 độ" is text, not a flag. */
+const FLAG_LIKE = /^--?[A-Za-z][\w-]*(?:=.*)?$/;
+
+/**
+ * `--flag value` and `--flag=value`; `--` ends options; `-h`/`--help` anywhere
+ * asks for usage. Any other flag-shaped token is an error instead of becoming
+ * message text, and a value never swallows the next flag.
+ */
 export function parseCommand(argv: string[]): ParsedCommand {
-	const parsed: ParsedCommand = { positional: [], flags: new Map(), noStream: false, json: false };
+	const parsed: ParsedCommand = { positional: [], flags: new Map(), noStream: false, json: false, help: false };
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index];
 		if (arg === undefined) continue;
+		if (arg === "--") {
+			parsed.positional.push(...argv.slice(index + 1));
+			break;
+		}
+		if (arg === "--help" || arg === "-h") {
+			parsed.help = true;
+			continue;
+		}
 		if (arg === "--json") {
 			parsed.json = true;
 			continue;
@@ -141,32 +188,52 @@ export function parseCommand(argv: string[]): ParsedCommand {
 			parsed.noStream = true;
 			continue;
 		}
-		if (arg === "--scope" || arg === "--target" || arg === "--file") {
-			const value = argv[index + 1];
-			if (value === undefined) throw new Error(`Thiếu giá trị cho ${arg}`);
-			const list = parsed.flags.get(arg) ?? [];
+		const equals = arg.startsWith("--") ? arg.indexOf("=") : -1;
+		const name = equals > 0 ? arg.slice(0, equals) : arg;
+		if (VALUE_FLAGS.has(name)) {
+			let value: string | undefined;
+			if (equals > 0) {
+				value = arg.slice(equals + 1);
+			} else {
+				const next = argv[index + 1];
+				if (next !== undefined && next !== "--" && !FLAG_LIKE.test(next)) {
+					value = next;
+					index += 1;
+				}
+			}
+			if (value === undefined || value.length === 0) throw new UsageError(CLI_MESSAGES.missingValue(name));
+			const list = parsed.flags.get(name) ?? [];
 			list.push(value);
-			parsed.flags.set(arg, list);
-			index += 1;
+			parsed.flags.set(name, list);
 			continue;
 		}
-		if (arg.startsWith("--")) throw new Error(`Tham số không hỗ trợ: ${arg}`);
+		if (FLAG_LIKE.test(arg)) throw new UsageError(CLI_MESSAGES.unsupportedFlag(arg));
 		parsed.positional.push(arg);
 	}
 	return parsed;
 }
 
+/** Reject flags that the command would otherwise silently ignore. */
+function allowFlags(parsed: ParsedCommand, command: string, allowed: readonly string[]): void {
+	const present = [...parsed.flags.keys()];
+	if (parsed.json) present.push("--json");
+	if (parsed.noStream) present.push("--no-stream");
+	for (const flag of present) {
+		if (!allowed.includes(flag)) throw new UsageError(CLI_MESSAGES.flagNotForCommand(command, flag));
+	}
+}
+
 function singleFlag(parsed: ParsedCommand, name: string): string | undefined {
 	const values = parsed.flags.get(name);
 	if (values === undefined) return undefined;
-	if (values.length > 1) throw new Error(`${name} chỉ được dùng một lần`);
+	if (values.length > 1) throw new UsageError(CLI_MESSAGES.flagOnce(name));
 	return values[0];
 }
 
 function scopeFlag(parsed: ParsedCommand): Scope {
 	const value = singleFlag(parsed, "--scope") ?? "repo";
 	if (value !== "worktree" && value !== "repo" && value !== "all") {
-		throw new Error(`--scope phải là worktree, repo hoặc all (nhận: ${value})`);
+		throw new UsageError(CLI_MESSAGES.badScope(value));
 	}
 	return value;
 }
@@ -176,8 +243,9 @@ function includeFiles(parsed: ParsedCommand): IncludeFileInput[] {
 }
 
 async function runList(parsed: ParsedCommand, io: CliIO): Promise<number> {
+	allowFlags(parsed, "list", ["--scope", "--json"]);
 	const scope = scopeFlag(parsed);
-	if (parsed.positional.length > 0) throw new Error("ab list không nhận tham số vị trí");
+	if (parsed.positional.length > 0) throw new UsageError(CLI_MESSAGES.listNoPositional);
 	const caller = await cliCaller(io.cwd);
 	const views = await collectSessions(caller, { fetchStatus: true });
 	const scoped = filterByScope(views, caller, scope);
@@ -187,58 +255,75 @@ async function runList(parsed: ParsedCommand, io: CliIO): Promise<number> {
 }
 
 async function runStatus(parsed: ParsedCommand, io: CliIO): Promise<number> {
-	if (parsed.positional.length > 1) throw new Error("ab status nhận tối đa một target");
+	allowFlags(parsed, "status", ["--target"]);
+	if (parsed.positional.length > 1) throw new UsageError(CLI_MESSAGES.statusOneTarget);
+	const flagTarget = singleFlag(parsed, "--target");
+	if (flagTarget !== undefined && parsed.positional.length > 0) throw new UsageError(CLI_MESSAGES.statusTargetTwice);
 	const caller = await cliCaller(io.cwd);
 	const views = await collectSessions(caller);
-	const selected = resolveTarget(caller, views, parsed.positional[0]);
+	const selected = resolveTarget(caller, views, flagTarget ?? parsed.positional[0]);
 	const status = await statusOf(caller, selected.record);
 	line(io, formatStatus(selected, status));
 	return 0;
 }
 
 async function runConsult(parsed: ParsedCommand, io: CliIO): Promise<number> {
+	allowFlags(parsed, "consult", ["--target", "--file", "--no-stream"]);
 	const question = parsed.positional.join(" ").trim();
-	if (question.length === 0) throw new Error('ab consult cần câu hỏi: ab consult "<question>"');
+	if (question.length === 0) throw new UsageError(CLI_MESSAGES.consultNeedsQuestion);
 	const target = singleFlag(parsed, "--target");
 	const caller = await cliCaller(io.cwd);
 	const views = await collectSessions(caller);
 	const attachments = await readIncludeFiles(caller.root, includeFiles(parsed), caller.caseInsensitive);
 	const stream = !parsed.noStream;
 
-	let wroteDelta = false;
+	// Deltas are a live preview; the reply in the result is authoritative.
+	let streamed = "";
 	const { record, result } = await consultTarget(caller, views, target, question, attachments, {
-		timeoutMs: 600_000,
+		timeoutMs: CLI_TIMEOUT_MS,
 		stream,
 		onProgress: (progress) => {
 			if (progress.phase === "awaiting_consent") {
 				line(io, MCP_MESSAGES.awaitingConsent, "stderr");
 				return;
 			}
-			if (progress.phase === "delta" && progress.delta !== undefined && progress.delta.length > 0 && stream) {
-				io.stdout(progress.delta);
-				wroteDelta = true;
-			}
+			if (!stream || progress.phase !== "delta" || progress.delta === undefined) return;
+			const delta = sanitizeText(progress.delta);
+			if (delta.length === 0) return;
+			io.stdout(delta);
+			streamed += delta;
 		},
 	});
 
-	if (stream) {
-		if (wroteDelta) io.stdout("\n");
-		line(io, formatConsultHeader(record, result));
-	} else {
+	if (!stream) {
 		line(io, formatConsultResult(record, result));
+		return 0;
 	}
+	const reply = sanitizeText(result.replyText);
+	if (reply.startsWith(streamed)) {
+		// The host never streams an unterminated last line: print what is missing.
+		const tail = reply.slice(streamed.length);
+		if (tail.length > 0) io.stdout(tail);
+		if (reply.length > 0 && !reply.endsWith("\n")) io.stdout("\n");
+	} else {
+		// Dedupe, truncation or a muted key block changed the text: print it whole.
+		if (streamed.length > 0 && !streamed.endsWith("\n")) io.stdout("\n");
+		line(io, CLI_MESSAGES.fullReplyFollows);
+		line(io, reply);
+	}
+	line(io, formatConsultHeader(record, result));
 	return 0;
 }
 
 async function runChat(parsed: ParsedCommand, io: CliIO): Promise<number> {
+	allowFlags(parsed, "chat", ["--target"]);
 	const message = parsed.positional.join(" ").trim();
-	if (message.length === 0) throw new Error('ab chat cần tin nhắn: ab chat "<message>"');
-	if (parsed.json) throw new Error("ab chat không hỗ trợ --json");
+	if (message.length === 0) throw new UsageError(CLI_MESSAGES.chatNeedsMessage);
 	const target = singleFlag(parsed, "--target");
 	const caller = await cliCaller(io.cwd);
 	const views = await collectSessions(caller);
 	const { record, result } = await chatTarget(caller, views, target, message, {
-		timeoutMs: 600_000,
+		timeoutMs: CLI_TIMEOUT_MS,
 		onProgress: (progress) => {
 			if (progress.phase === "awaiting_consent") line(io, MCP_MESSAGES.awaitingConsent, "stderr");
 		},
@@ -257,12 +342,9 @@ export interface InstalledPluginRecord {
 	enabled: boolean;
 }
 
-export interface ListedPluginRecord extends InstalledPluginRecord {
-	mcpServers: string[];
-}
-
 export interface ClaudePluginState {
-	source: "registry" | "cli" | "none";
+	/** `unknown`: the registry exists but cannot be read; doctor never spawns `claude` (01 §10). */
+	source: "registry" | "unknown" | "none";
 	installed: boolean;
 	enabled: boolean;
 	id?: string;
@@ -286,8 +368,6 @@ export interface OmpPluginState {
 	path?: string;
 	hasExtension: boolean;
 }
-
-const CLAUDE_PLUGIN_LIST_TIMEOUT_MS = 3_000;
 
 function splitPluginId(id: string): { name: string; marketplace: string } {
 	const at = id.lastIndexOf("@");
@@ -328,34 +408,6 @@ export function parseInstalledPluginsJson(raw: string): InstalledPluginRecord[] 
 	return records;
 }
 
-/** `claude plugin list --json` is an array; `mcpServers` is inline or read from `.mcp.json`. */
-export function parsePluginListJson(raw: string): ListedPluginRecord[] | undefined {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch {
-		return undefined;
-	}
-	if (!Array.isArray(parsed)) return undefined;
-	const records: ListedPluginRecord[] = [];
-	for (const item of parsed) {
-		if (!isRecord(item) || typeof item.id !== "string") continue;
-		const { name, marketplace } = splitPluginId(item.id);
-		const record: ListedPluginRecord = {
-			id: item.id,
-			name,
-			marketplace,
-			enabled: item.enabled !== false,
-			mcpServers: isRecord(item.mcpServers) ? Object.keys(item.mcpServers) : [],
-		};
-		if (typeof item.scope === "string") record.scope = item.scope;
-		if (typeof item.installPath === "string") record.installPath = item.installPath;
-		if (typeof item.version === "string") record.version = item.version;
-		records.push(record);
-	}
-	return records;
-}
-
 async function readPluginMcpServerNames(installPath: string | undefined): Promise<string[] | undefined> {
 	if (installPath === undefined) return undefined;
 	const files = [join(installPath, ".mcp.json"), join(installPath, ".claude-plugin", "plugin.json")];
@@ -391,99 +443,36 @@ async function readPluginMcpServerNames(installPath: string | undefined): Promis
 	return sawConfig ? [...names] : undefined;
 }
 
-async function runClaudePluginListJson(): Promise<string | undefined> {
-	try {
-		const proc = Bun.spawn(["claude", "plugin", "list", "--json"], {
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "ignore",
-			env: process.env,
-		});
-		const timer = setTimeout(() => {
-			try {
-				proc.kill("SIGKILL");
-			} catch {
-				// already exited
-			}
-		}, CLAUDE_PLUGIN_LIST_TIMEOUT_MS);
-		try {
-			const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-			return exitCode === 0 ? stdout : undefined;
-		} finally {
-			clearTimeout(timer);
-		}
-	} catch {
-		return undefined;
-	}
-}
-
-/** Prefer the installed_plugins.json registry; fall back to the read-only CLI when it is missing/unreadable. */
+/**
+ * Read `~/.claude/plugins/installed_plugins.json` only. Spec §10 forbids
+ * spawning `claude` other than `claude agents --json`, and `claude plugin list`
+ * can write files under HOME, so an unreadable registry is reported instead.
+ */
 export async function detectClaudePlugin(home: string): Promise<ClaudePluginState> {
+	const absent: ClaudePluginState = { source: "none", installed: false, enabled: false, mcpRegistered: false, mcpKnown: false };
 	const registryPath = join(home, ".claude", "plugins", "installed_plugins.json");
-	let registryMatch: InstalledPluginRecord | undefined;
+	let raw: string;
 	try {
-		const records = parseInstalledPluginsJson(await readFile(registryPath, "utf8"));
-		if (records !== undefined) {
-			const matches = records.filter((record) => isAgentBridgePluginName(record.name));
-			if (matches.length === 0) {
-				return { source: "registry", installed: false, enabled: false, mcpRegistered: false, mcpKnown: false };
-			}
-			const chosen = matches.find((record) => record.enabled) ?? matches[0];
-			if (chosen !== undefined) {
-				const servers = await readPluginMcpServerNames(chosen.installPath);
-				if (servers !== undefined) {
-					const state: ClaudePluginState = {
-						source: "registry",
-						installed: true,
-						enabled: chosen.enabled,
-						id: chosen.id,
-						mcpRegistered: servers.includes("agentbridge"),
-						mcpKnown: true,
-					};
-					if (chosen.installPath !== undefined) state.installPath = chosen.installPath;
-					return state;
-				}
-				registryMatch = chosen;
-			}
-		}
-	} catch {
-		// Missing/unreadable registry: try the CLI.
+		raw = await readFile(registryPath, "utf8");
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? absent : { ...absent, source: "unknown" };
 	}
-
-	const listed = parsePluginListJson((await runClaudePluginListJson()) ?? "");
-	if (listed !== undefined) {
-		const matches = listed.filter((record) => isAgentBridgePluginName(record.name));
-		const chosen = matches.find((record) => record.enabled) ?? matches[0];
-		if (chosen !== undefined) {
-			const state: ClaudePluginState = {
-				source: "cli",
-				installed: true,
-				enabled: chosen.enabled,
-				id: chosen.id,
-				mcpRegistered: chosen.mcpServers.includes("agentbridge"),
-				mcpKnown: true,
-			};
-			if (chosen.installPath !== undefined) state.installPath = chosen.installPath;
-			return state;
-		}
-		if (registryMatch === undefined) {
-			return { source: "cli", installed: false, enabled: false, mcpRegistered: false, mcpKnown: false };
-		}
-	}
-
-	if (registryMatch !== undefined) {
-		const state: ClaudePluginState = {
-			source: "registry",
-			installed: true,
-			enabled: registryMatch.enabled,
-			id: registryMatch.id,
-			mcpRegistered: false,
-			mcpKnown: false,
-		};
-		if (registryMatch.installPath !== undefined) state.installPath = registryMatch.installPath;
-		return state;
-	}
-	return { source: "none", installed: false, enabled: false, mcpRegistered: false, mcpKnown: false };
+	const records = parseInstalledPluginsJson(raw);
+	if (records === undefined) return { ...absent, source: "unknown" };
+	const matches = records.filter((record) => isAgentBridgePluginName(record.name));
+	const chosen = matches.find((record) => record.enabled) ?? matches[0];
+	if (chosen === undefined) return { ...absent, source: "registry" };
+	const servers = await readPluginMcpServerNames(chosen.installPath);
+	const state: ClaudePluginState = {
+		source: "registry",
+		installed: true,
+		enabled: chosen.enabled,
+		id: chosen.id,
+		mcpRegistered: servers?.includes("agentbridge") ?? false,
+		mcpKnown: servers !== undefined,
+	};
+	if (chosen.installPath !== undefined) state.installPath = chosen.installPath;
+	return state;
 }
 
 /**
@@ -568,7 +557,7 @@ async function readOmpPluginEnabled(pluginsRoot: string): Promise<Map<string, bo
 
 /** OMP marketplace installs live in installed_plugins.json + a node_modules link; npm/link installs only have the link. */
 export async function detectOmpPlugin(home: string): Promise<OmpPluginState> {
-	const pluginsRoot = join(home, ".omp", "plugins");
+	const pluginsRoot = join(ompConfigRoot(home), "plugins");
 	const candidates: Array<{ path: string; pkg: OmpPluginPackage }> = [];
 	for (const dir of await listOmpPackageDirs(join(pluginsRoot, "node_modules"))) {
 		const pkg = await readOmpPackage(join(dir, "package.json"));
@@ -612,15 +601,58 @@ interface DoctorCheck {
 	detail?: string;
 }
 
-async function secureDirCheck(label: string, path: string): Promise<DoctorCheck> {
-	if (!existsSync(path)) return { status: "warn", label, detail: `${path} chưa tồn tại (OMP chưa chạy?)` };
+/** lstat-based: a symlink or foreign/loose directory fails like it does for the host. */
+async function dirCheck(label: string, path: string, missingHint: string): Promise<DoctorCheck> {
 	try {
 		await assertSecureDir(path);
 		return { status: "ok", label, detail: path };
 	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
-		return { status: "fail", label, detail };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return { status: "warn", label, detail: CLI_MESSAGES.dirMissing(path, missingHint) };
+		}
+		return { status: "fail", label, detail: error instanceof Error ? error.message : String(error) };
 	}
+}
+
+/** Strict read: a schema error is a failure, not the loader's silent safe defaults. */
+async function configChecks(configFile: string): Promise<DoctorCheck[]> {
+	const read = await readConfigStrict(configFile);
+	if (read.kind === "missing") {
+		return [{ status: "warn", label: "config", detail: CLI_MESSAGES.configMissing(configFile) }];
+	}
+	if (read.kind === "invalid") {
+		return [{ status: "fail", label: "config", detail: CLI_MESSAGES.configInvalid(configFile, read.reason) }];
+	}
+	const checks: DoctorCheck[] = [];
+	const relative = read.config.projects.filter((project) => !isAbsolute(project));
+	const missing: string[] = [];
+	for (const project of read.config.projects) {
+		if (!isAbsolute(project)) continue;
+		try {
+			await realpath(project);
+		} catch {
+			missing.push(project);
+		}
+	}
+	const usable = read.config.projects.length - relative.length - missing.length;
+	checks.push({ status: "ok", label: "config", detail: CLI_MESSAGES.configOk(usable) });
+	if (relative.length > 0) {
+		checks.push({ status: "warn", label: "config projects", detail: CLI_MESSAGES.relativeProjects(relative) });
+	}
+	if (missing.length > 0) {
+		checks.push({ status: "warn", label: "config projects", detail: CLI_MESSAGES.missingProjects(missing) });
+	}
+	try {
+		const info = await lstat(configFile);
+		const uid = process.getuid?.();
+		// Autochat and /agentbridge allow|disallow require exactly 0600, same uid, no symlink.
+		if (info.isSymbolicLink() || (info.mode & 0o777) !== 0o600 || (uid !== undefined && info.uid !== uid)) {
+			checks.push({ status: "warn", label: "config permissions", detail: CLI_MESSAGES.configPermissions(configFile) });
+		}
+	} catch {
+		// read succeeded a moment ago; a vanished file is reported on the next run
+	}
+	return checks;
 }
 
 async function mcpRegistration(file: string): Promise<"yes" | "no" | "unreadable" | "missing"> {
@@ -686,7 +718,8 @@ async function projectExtensionCheck(cwd: string): Promise<DoctorCheck | undefin
 }
 
 async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
-	if (parsed.positional.length > 0) throw new Error("ab doctor không nhận tham số");
+	allowFlags(parsed, "doctor", []);
+	if (parsed.positional.length > 0) throw new UsageError(CLI_MESSAGES.doctorNoArgs);
 	const checks: DoctorCheck[] = [];
 	const home = homeDirectory();
 	const dirs = resolveDirs(process.env, process.platform, home);
@@ -697,7 +730,11 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 	line(io, `  runtime dir: ${dirs.runtimeDir}`);
 	line(io, "");
 
-	checks.push({ status: "ok", label: "bun", detail: Bun.version });
+	checks.push(
+		Bun.semver.satisfies(Bun.version, ">=1.4.0")
+			? { status: "ok", label: "bun", detail: Bun.version }
+			: { status: "warn", label: "bun", detail: CLI_MESSAGES.bunTooOld(Bun.version) },
+	);
 
 	for (const binary of ["claude", "omp"]) {
 		const found = Bun.which(binary);
@@ -708,8 +745,19 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 		);
 	}
 
-	checks.push(await secureDirCheck("runtime dir", dirs.runtimeDir));
-	checks.push(await secureDirCheck("sessions dir", dirs.sessionsDir));
+	// The host requires all four (core `ensureRuntimeDirs`); the state dir is created on first audit.
+	// A missing runtime dir implies its children: report it once instead of three times.
+	checks.push(await dirCheck("home dir", dirs.homeDir, CLI_MESSAGES.hintNotInstalled));
+	const runtimeCheck = await dirCheck("runtime dir", dirs.runtimeDir, CLI_MESSAGES.hintOmpNotRunning);
+	checks.push(runtimeCheck);
+	if (runtimeCheck.status === "ok") {
+		checks.push(await dirCheck("sessions dir", dirs.sessionsDir, CLI_MESSAGES.hintOmpNotRunning));
+		checks.push(await dirCheck("socket dir", dirs.socketsDir, CLI_MESSAGES.hintOmpNotRunning));
+	}
+	// A missing state dir is normal until the first audit; anything present (even a dangling symlink) is checked.
+	if (await lstat(dirs.stateDir).then(() => true, () => false)) {
+		checks.push(await dirCheck("state dir", dirs.stateDir, CLI_MESSAGES.hintNoAudit));
+	}
 
 	const legacy = legacyXdgDirs(process.env, home).filter((entry) => existsSync(entry.path));
 	if (legacy.length > 0) {
@@ -720,26 +768,11 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 			detail: `${listing} vẫn tồn tại — đây là đường dẫn legacy, không còn là mặc định và không được tự di chuyển; chuyển config/state vào ${dirs.homeDir} hoặc đặt AGENTBRIDGE_HOME`,
 		});
 	}
-	if (!existsSync(dirs.configFile)) {
-		checks.push({
-			status: "warn",
-			label: "config",
-			detail: `${dirs.configFile} chưa có (mặc định an toàn: projects = [])`,
-		});
-	} else {
-		try {
-			JSON.parse(await readFile(dirs.configFile, "utf8"));
-			const config = await loadConfig(dirs.configFile);
-			checks.push({ status: "ok", label: "config", detail: `${config.projects.length} project được phép` });
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			checks.push({ status: "fail", label: "config", detail });
-		}
-	}
+	checks.push(...(await configChecks(dirs.configFile)));
 
 	const [claudePlugin, ompPlugin] = await Promise.all([detectClaudePlugin(home), detectOmpPlugin(home)]);
 
-	const extension = join(home, ".omp", "agent", "extensions", "agentbridge.js");
+	const extension = join(ompAgentDir(home), "extensions", "agentbridge.js");
 	const extensionExists = existsSync(extension);
 	if (extensionExists) {
 		checks.push({ status: "ok", label: "extension OMP (dev)", detail: extension });
@@ -790,6 +823,9 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 		});
 	}
 
+	if (claudePlugin.source === "unknown") {
+		checks.push({ status: "warn", label: "Claude plugin AgentBridge", detail: CLI_MESSAGES.pluginRegistryUnreadable(home) });
+	}
 	if (claudePlugin.installed) {
 		const id = claudePlugin.id ?? "agentbridge@agentbridge";
 		const commands = `cập nhật: claude plugin update ${id}; gỡ: claude plugin uninstall ${id}`;
@@ -869,14 +905,22 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 }
 
 async function runSweep(parsed: ParsedCommand, io: CliIO): Promise<number> {
-	if (parsed.positional.length > 0) throw new Error("ab sweep không nhận tham số");
+	allowFlags(parsed, "sweep", []);
+	if (parsed.positional.length > 0) throw new UsageError(CLI_MESSAGES.sweepNoArgs);
 	const removed = await sweepStale();
-	line(io, `Đã dọn ${removed} bản ghi stale.`);
+	line(io, CLI_MESSAGES.swept(removed));
 	return 0;
 }
 
 export async function runCli(argv: string[], overrides: Partial<CliIO> = {}): Promise<number> {
-	const io: CliIO = { ...defaultIO(), ...overrides };
+	let io: CliIO;
+	try {
+		io = { ...defaultIO(overrides.cwd), ...overrides };
+	} catch (error) {
+		// e.g. the working directory was deleted under the shell
+		process.stderr.write(`${CLI_MESSAGES.noCwd(error instanceof Error ? error.message : String(error))}\n`);
+		return 1;
+	}
 	const command = argv[0];
 	if (command === undefined || command === "help" || command === "--help" || command === "-h") {
 		line(io, CLI_USAGE);
@@ -887,8 +931,12 @@ export async function runCli(argv: string[], overrides: Partial<CliIO> = {}): Pr
 	try {
 		parsed = parseCommand(argv.slice(1));
 	} catch (error) {
-		line(io, failureFrom(error).detail ?? String(error), "stderr");
+		line(io, error instanceof Error ? error.message : String(error), "stderr");
 		return 2;
+	}
+	if (parsed.help) {
+		line(io, CLI_USAGE);
+		return 0;
 	}
 
 	try {
@@ -906,11 +954,15 @@ export async function runCli(argv: string[], overrides: Partial<CliIO> = {}): Pr
 			case "sweep":
 				return await runSweep(parsed, io);
 			default:
-				line(io, `Lệnh không hỗ trợ: ${command}`, "stderr");
+				line(io, CLI_MESSAGES.unknownCommand(command), "stderr");
 				line(io, CLI_USAGE, "stderr");
 				return 2;
 		}
 	} catch (error) {
+		if (error instanceof UsageError) {
+			line(io, error.message, "stderr");
+			return 2;
+		}
 		line(io, formatFailure(failureFrom(error)), "stderr");
 		return 1;
 	}

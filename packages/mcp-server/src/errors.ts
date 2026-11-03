@@ -1,5 +1,5 @@
 /** Tool failures, Vietnamese mapping, and option tables for the model. */
-import { isErrorCode, isRetryable, type MatchSummary, ProtocolError } from "@agentbridge/protocol";
+import { isErrorCode, isRetryable, type MatchSummary, ProtocolError, sanitizeLabel } from "@agentbridge/protocol";
 import { ERROR_TEXT, MCP_MESSAGES } from "./messages";
 
 export interface TargetOption extends MatchSummary {
@@ -38,7 +38,7 @@ const RETRYABLE_NOTE =
 	"Lưu ý: lỗi này được đánh dấu retryable ở giao thức, nhưng AgentBridge KHÔNG tự động thử lại vì mỗi lần chạy là một lần suy luận mới.";
 
 function escapeCell(value: string): string {
-	return value.replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+	return sanitizeLabel(value, 300).replace(/\|/g, "\\|");
 }
 
 function formatOptions(options: TargetOption[]): string {
@@ -98,7 +98,9 @@ export function failureFrom(error: unknown): Failure {
 
 export function formatFailure(failure: Failure): string {
 	const lines = [`[AgentBridge] ${failure.code} — ${failure.message}`, `Gợi ý: ${failure.hint}`];
-	if (failure.detail !== undefined && failure.detail.length > 0) lines.push(`Chi tiết: ${failure.detail}`);
+	// Details can carry host or model text: one sanitized line.
+	const detail = failure.detail === undefined ? "" : sanitizeLabel(failure.detail, 1_000);
+	if (detail.length > 0) lines.push(`Chi tiết: ${detail}`);
 	if (isErrorCode(failure.code) && isRetryable(failure.code)) lines.push(RETRYABLE_NOTE);
 	if (failure.options !== undefined) {
 		const options = formatOptions(failure.options);
