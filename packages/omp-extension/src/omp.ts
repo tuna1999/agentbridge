@@ -38,6 +38,10 @@ export type OmpSelectItem = string | OmpSelectOption;
 export interface OmpDialogOptions {
  signal?: AbortSignal;
  timeout?: number;
+ /** types.ts:211; the adapter uses it to tell a timeout from a real choice. */
+ onTimeout?: () => void;
+ /** types.ts:224; option highlighted when the dialog opens (and picked on timeout). */
+ initialIndex?: number;
 }
 
 /** types.ts:253-257 `ExtensionWidgetOptions` (subset). */
@@ -287,10 +291,12 @@ export function createOmpLike(pi: PiLike, extensionVersion: string): OmpLike {
    }
   },
   isIdle(ctx): boolean {
+   // Unknown means busy: chat then queues as a follow-up (or refuses) instead
+   // of omitting `deliverAs`, which OMP treats as a steer while a turn runs.
    try {
-    return typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+    return typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
    } catch {
-    return true;
+    return false;
    }
   },
   hasPendingMessages(ctx): boolean {
@@ -325,7 +331,18 @@ export function createOmpLike(pi: PiLike, extensionVersion: string): OmpLike {
   },
   async select(ctx, title, options, dialogOptions) {
    if (typeof ctx.ui.select !== "function") throw new Error("ctx.ui.select is unavailable");
-   return ctx.ui.select(title, options, dialogOptions);
+   // OMP's TUI selector does not return undefined on timeout: it calls
+   // `onTimeout` and then resolves with the highlighted option
+   // (pi-tui overlays/hook-selector.ts). A timeout is never a choice here.
+   let timedOut = false;
+   const choice = await ctx.ui.select(title, options, {
+    ...dialogOptions,
+    onTimeout: () => {
+     timedOut = true;
+     dialogOptions?.onTimeout?.();
+    },
+   });
+   return timedOut ? undefined : choice;
   },
   async runEphemeralTurn(ctx, options) {
    if (typeof ctx.runEphemeralTurn !== "function") {

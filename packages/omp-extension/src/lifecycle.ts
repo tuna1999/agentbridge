@@ -71,6 +71,7 @@ import {
  changeProjectConfig,
  inspectConfig,
 } from "./project-config";
+import { HOST_TEXT } from "./messages";
 import { isSelfTarget } from "./self-target";
 import {
  type OmpAgentEndLike,
@@ -87,6 +88,8 @@ import {
 const RECORD_REFRESH_MS = 60_000;
 /** TUI confirm dialog budget for allow/disallow; no config setting is added. */
 const PROJECT_CONFIRM_TIMEOUT_MS = 60_000;
+/** Session names are written to the record; keep them well below the registry bound. */
+const MAX_SESSION_NAME_CHARS = 256;
 
 type AgentStatus = "idle" | "busy" | "waiting";
 
@@ -433,7 +436,7 @@ export class Host {
   if (this.#omp.isRootTui(ctx)) return true;
   this.#omp.notify(
    ctx,
-   `AgentBridge: /agentbridge ${commandName} chỉ dùng trong TUI chính; không thay đổi config.`,
+   HOST_TEXT.mainTuiOnly(commandName),
    "warning",
   );
   return false;
@@ -460,21 +463,22 @@ export class Host {
   action: ProjectAction,
   project: string,
  ): Promise<boolean> {
-  const label = action === "allow" ? "Cho phép" : "Bỏ cho phép";
+  const label = HOST_TEXT.projectActionLabel(action);
   let answer: string | undefined;
   try {
    answer = await this.#omp.select(
     ctx,
-    `AgentBridge: /agentbridge ${action} — ${label} project?\n${project}`,
-    ["Đồng ý", "Từ chối"],
-    { timeout: PROJECT_CONFIRM_TIMEOUT_MS },
+    HOST_TEXT.projectConfirmTitle(action, label, project),
+    [HOST_TEXT.agree, HOST_TEXT.refuse],
+    // Highlight "Từ chối": a timeout (adapter → undefined) or a reflexive Enter changes nothing.
+    { timeout: PROJECT_CONFIRM_TIMEOUT_MS, initialIndex: 1 },
    );
   } catch {
-   this.#omp.notify(ctx, "AgentBridge: không mở được hộp thoại xác nhận; config không thay đổi.", "warning");
+   this.#omp.notify(ctx, HOST_TEXT.confirmUnavailable, "warning");
    return false;
   }
-  if (answer !== "Đồng ý") {
-   this.#omp.notify(ctx, "AgentBridge: đã huỷ; config không thay đổi.", "info");
+  if (answer !== HOST_TEXT.agree) {
+   this.#omp.notify(ctx, HOST_TEXT.confirmCancelled, "info");
    return false;
   }
   return true;
@@ -497,7 +501,7 @@ export class Host {
   } catch (error) {
    this.#omp.notify(
     ctx,
-    `AgentBridge: không ghi được config (${dirs.configFile}): ${errorMessage(error).slice(0, 200)}`,
+    HOST_TEXT.configWriteFailed(dirs.configFile, errorMessage(error)),
     "warning",
    );
    return;
@@ -508,8 +512,8 @@ export class Host {
     this.#omp.notify(
      ctx,
      action === "allow"
-      ? `AgentBridge: đã cho phép project: ${project}`
-      : `AgentBridge: đã bỏ cho phép project: ${project}`,
+      ? HOST_TEXT.projectAllowed(project)
+      : HOST_TEXT.projectDisallowed(project),
      "info",
     );
     return;
@@ -517,36 +521,36 @@ export class Host {
     this.#omp.notify(
      ctx,
      result.present
-      ? `AgentBridge: project đã có trong danh sách: ${project}`
-      : `AgentBridge: project không có trong danh sách: ${project}`,
+      ? HOST_TEXT.projectAlreadyListed(project)
+      : HOST_TEXT.projectNotListed(project),
      "info",
     );
     return;
    case "invalid":
     this.#omp.notify(
      ctx,
-     `AgentBridge: config không hợp lệ: ${result.configPath} (${result.reason}); không ghi đè.`,
+     HOST_TEXT.configInvalidNoWrite(result.configPath, result.reason),
      "warning",
     );
     return;
    case "insecure":
     this.#omp.notify(
      ctx,
-     `AgentBridge: config không an toàn: ${result.configPath} (${result.reason}); không ghi.`,
+     HOST_TEXT.configInsecureNoWrite(result.configPath, result.reason),
      "warning",
     );
     return;
    case "config_inside_project":
     this.#omp.notify(
      ctx,
-     `AgentBridge: từ chối ghi config vì file nằm trong project được phép (${result.project}); hãy chuyển config ra ngoài project.`,
+     HOST_TEXT.configInsideProject(result.project),
      "warning",
     );
     return;
    case "write_failed":
     this.#omp.notify(
      ctx,
-     `AgentBridge: không ghi được config (${result.configPath}): ${result.reason.slice(0, 200)}`,
+     HOST_TEXT.configWriteFailed(result.configPath, result.reason),
      "warning",
     );
     return;
@@ -563,7 +567,7 @@ export class Host {
   } catch (error) {
    this.#omp.notify(
     ctx,
-    `AgentBridge: không đọc được config (${dirs.configFile}): ${errorMessage(error).slice(0, 200)}`,
+    HOST_TEXT.configReadFailed(dirs.configFile, errorMessage(error)),
     "warning",
    );
    return;
@@ -574,8 +578,8 @@ export class Host {
     this.#omp.notify(
      ctx,
      [
-      `AgentBridge: config chưa có (dùng mặc định an toàn): ${dirs.configFile}`,
-      "projects: (trống)",
+      HOST_TEXT.configMissingHeader(dirs.configFile),
+      HOST_TEXT.projectsLine([]),
       `chat.enabled: ${String(DEFAULT_CONFIG.chat.enabled)}`,
       `chat.autoApprove: ${DEFAULT_CONFIG.chat.autoApprove}`,
      ].join("\n"),
@@ -585,25 +589,23 @@ export class Host {
    case "invalid":
     this.#omp.notify(
      ctx,
-     `AgentBridge: config không hợp lệ: ${dirs.configFile} (${inspected.reason}); không ghi đè.`,
+     HOST_TEXT.configInvalidNoWrite(dirs.configFile, inspected.reason),
      "warning",
     );
     return;
    case "insecure":
     this.#omp.notify(
      ctx,
-     `AgentBridge: config không an toàn: ${dirs.configFile} (${inspected.reason})`,
+     HOST_TEXT.configInsecure(dirs.configFile, inspected.reason),
      "warning",
     );
     return;
    case "ok": {
-    const projects =
-     inspected.config.projects.length === 0 ? "(trống)" : inspected.config.projects.join(", ");
     this.#omp.notify(
      ctx,
      [
-      `AgentBridge: config: ${dirs.configFile}`,
-      `projects: ${projects}`,
+      HOST_TEXT.configHeader(dirs.configFile),
+      HOST_TEXT.projectsLine(inspected.config.projects),
       `chat.enabled: ${String(inspected.config.chat.enabled)}`,
       `chat.autoApprove: ${inspected.config.chat.autoApprove}`,
      ].join("\n"),
@@ -625,19 +627,19 @@ export class Host {
     return;
    case "trust":
     this.#trusted = true;
-    this.#omp.notify(ctx, "AgentBridge: đã tin phiên này (chỉ trong bộ nhớ).", "info");
+    this.#omp.notify(ctx, HOST_TEXT.trusted, "info");
     return;
    case "untrust":
     this.#trusted = false;
-    this.#omp.notify(ctx, "AgentBridge: đã bỏ tin cậy phiên này.", "info");
+    this.#omp.notify(ctx, HOST_TEXT.untrusted, "info");
     return;
    case "off":
     await this.pause(ctx);
-    this.#omp.notify(ctx, "AgentBridge: đã tắt server cho phiên này.", "info");
+    this.#omp.notify(ctx, HOST_TEXT.serverOff, "info");
     return;
    case "on":
     await this.resume(ctx);
-    this.#omp.notify(ctx, "AgentBridge: đã bật lại server cho phiên này.", "info");
+    this.#omp.notify(ctx, HOST_TEXT.serverOn, "info");
     return;
    case "allow":
    case "disallow":
@@ -651,7 +653,7 @@ export class Host {
     if (requested.length === 0) {
      this.#omp.notify(
       ctx,
-      `AgentBridge: autochat ${this.#auto.mode} (${autoSourceLabel(this.#auto.source)}). Dùng /agentbridge autochat off|limited [phút]|unlimited.`,
+      HOST_TEXT.autochatState(this.#auto.mode, autoSourceLabel(this.#auto.source)),
       "info",
      );
      return;
@@ -659,7 +661,7 @@ export class Host {
     if (!isAutoApproveMode(requested)) {
      this.#omp.notify(
       ctx,
-      "AgentBridge: dùng /agentbridge autochat off|limited [phút]|unlimited.",
+      HOST_TEXT.autochatUsage,
       "warning",
      );
      return;
@@ -670,7 +672,7 @@ export class Host {
      this.#startAutoLimitTimer(ctx, undefined);
      this.#auto.configure("off", "tui");
      this.#refreshBridgeStatus(ctx);
-     this.#omp.notify(ctx, "AgentBridge: autochat đã tắt cho phiên này.", "info");
+     this.#omp.notify(ctx, HOST_TEXT.autochatOff, "info");
      return;
     }
 
@@ -679,7 +681,7 @@ export class Host {
      this.#startAutoLimitTimer(ctx, undefined);
      this.#auto.configure("unlimited", "tui");
      this.#refreshBridgeStatus(ctx);
-     this.#omp.notify(ctx, "AgentBridge: autochat unlimited bật từ lệnh TUI.", "info");
+     this.#omp.notify(ctx, HOST_TEXT.autochatUnlimitedTui, "info");
      this.#notifyUnlimited(ctx);
      return;
     }
@@ -692,7 +694,7 @@ export class Host {
      if (!Number.isInteger(parsed) || parsed <= 0) {
       this.#omp.notify(
        ctx,
-       "AgentBridge: số phút phải là số nguyên dương (tối đa 480).",
+       HOST_TEXT.autochatBadMinutes,
        "warning",
       );
       return;
@@ -702,7 +704,7 @@ export class Host {
       minutes = AUTOCHAT_LIMITED_MAX_MINUTES;
       this.#omp.notify(
        ctx,
-       `AgentBridge: thời hạn autochat tối đa ${AUTOCHAT_LIMITED_MAX_MINUTES} phút; đã kẹp về ${AUTOCHAT_LIMITED_MAX_MINUTES}.`,
+       HOST_TEXT.autochatMinutesClamped(AUTOCHAT_LIMITED_MAX_MINUTES),
        "warning",
       );
      }
@@ -716,21 +718,19 @@ export class Host {
     this.#refreshBridgeStatus(ctx);
     this.#omp.notify(
      ctx,
-     minutes === undefined
-      ? "AgentBridge: autochat limited bật từ lệnh TUI."
-      : `AgentBridge: autochat limited bật từ lệnh TUI trong ${minutes} phút.`,
+     HOST_TEXT.autochatLimitedTui(minutes),
      "info",
     );
     return;
    }
    case "clear":
     this.#consult.clearWidget(ctx);
-    this.#omp.notify(ctx, "AgentBridge: đã xoá widget.", "info");
+    this.#omp.notify(ctx, HOST_TEXT.widgetCleared, "info");
     return;
    default:
     this.#omp.notify(
      ctx,
-     "AgentBridge: dùng /agentbridge [status|trust|untrust|autochat|off|on|clear|allow|disallow|config].",
+     HOST_TEXT.commandUsage,
      "warning",
     );
   }
@@ -776,7 +776,7 @@ export class Host {
  notifyError(ctx: OmpContextLike, error: unknown): void {
   if (this.#warned) return;
   this.#warned = true;
-  this.#omp.notify(ctx, `AgentBridge lỗi: ${errorMessage(error).slice(0, 300)}`, "warning");
+  this.#omp.notify(ctx, HOST_TEXT.error(errorMessage(error)), "warning");
  }
 
  /** §7.2: warn once, then disable hosting without affecting OMP. */
@@ -806,24 +806,23 @@ export class Host {
   const config = await loadConfig();
   const allowed = projectAllowed(config.projects, active?.git?.worktree ?? cwd);
   const status = active?.status ?? (this.#enabled ? "offline" : "off");
-  const trust = this.#trusted ? " (trusted trong phiên)" : "";
   const auto = this.#auto;
   const autoText =
    auto.mode === "off"
     ? "off"
     : auto.mode === "limited"
-     ? `limited ${auto.used}/${auto.quota ?? 0} (${autoSourceLabel(auto.source)})`
-     : `unlimited ∞ · ${auto.used} tin (${autoSourceLabel(auto.source)})`;
-  const lines = [
-   "AgentBridge",
-   `endpoint: ${active?.endpoint ?? "(chưa công bố)"}`,
-   `session: ${sessionId}`,
-   `trạng thái: ${status}`,
-   `project: ${allowed ? "được phép" : "không được phép"}`,
-   `consent: ${config.consult.consent}${trust}`,
-   `autochat: ${autoText}`,
-   `request: ${active?.requests ?? 0}`,
-  ];
+     ? HOST_TEXT.autochatLimitedState(auto.used, auto.quota ?? 0, autoSourceLabel(auto.source))
+     : HOST_TEXT.autochatUnlimitedState(auto.used, autoSourceLabel(auto.source));
+  const lines = HOST_TEXT.statusLines({
+   endpoint: active?.endpoint,
+   sessionId,
+   status,
+   projectAllowed: allowed,
+   consent: config.consult.consent,
+   trusted: this.#trusted,
+   autochat: autoText,
+   requests: active?.requests ?? 0,
+  });
   this.#omp.notify(ctx, lines.join("\n"), "info");
  }
 
@@ -839,10 +838,9 @@ export class Host {
  }
 
  #setBridgeStatus(active: ActiveSession): void {
-  const base =
-   active.capabilities.includes("consult") || active.capabilities.includes("chat")
-    ? "🔗 bridge"
-    : "🔗 bridge (status-only)";
+  const base = HOST_TEXT.statusBar(
+   active.capabilities.includes("consult") || active.capabilities.includes("chat"),
+  );
   this.#omp.setStatus(
    active.ctx,
    bridgeStatusText(base, this.#auto, active.capabilities.includes("chat")),
@@ -887,7 +885,7 @@ export class Host {
       this.#auto.configure("off", "tui");
       const target = this.#active?.ctx ?? ctx;
       this.#refreshBridgeStatus(target);
-      this.#omp.notify(target, "AgentBridge: autochat limited đã hết hạn.", "info");
+      this.#omp.notify(target, HOST_TEXT.autochatExpired, "info");
      } catch (error) {
       this.notifyError(ctx, error);
      }
@@ -938,7 +936,7 @@ export class Host {
     if (this.#autoTuiMode !== "off") {
      this.#omp.notify(
       ctx,
-      `AgentBridge: autochat ${this.#autoTuiMode} bật từ lệnh TUI.`,
+      HOST_TEXT.autochatModeTui(this.#autoTuiMode),
       "info",
      );
     }
@@ -963,7 +961,7 @@ export class Host {
     if (flag.mode !== "off") {
      this.#omp.notify(
       ctx,
-      `AgentBridge: autochat ${flag.mode} bật từ CLI (--${AUTOCHAT_FLAG}).`,
+      HOST_TEXT.autochatModeCli(flag.mode, AUTOCHAT_FLAG),
       "info",
      );
     }
@@ -973,7 +971,7 @@ export class Host {
    if (flag.present && flag.invalid !== undefined) {
     this.#omp.notify(
      ctx,
-     `AgentBridge: bỏ qua cờ --${AUTOCHAT_FLAG} không hợp lệ (${flag.invalid}).`,
+     HOST_TEXT.autochatBadFlag(AUTOCHAT_FLAG, flag.invalid),
      "warning",
     );
    }
@@ -1031,7 +1029,7 @@ export class Host {
    this.#auto.configure("off", "config");
    this.#omp.notify(
     ctx,
-    `AgentBridge: bỏ qua chat.autoApprove vì không kiểm tra được config (${errorMessage(error).slice(0, 160)}).`,
+    HOST_TEXT.autochatConfigUnchecked(errorMessage(error)),
     "warning",
    );
   }
@@ -1092,7 +1090,10 @@ export class Host {
    requests: 0,
   };
   const sessionName = omp.getSessionName();
-  if (sessionName !== undefined) active.sessionName = sessionName;
+  // Shown to Claude in result headers; the registry rejects absurd lengths.
+  if (typeof sessionName === "string" && sessionName.length > 0) {
+   active.sessionName = sessionName.slice(0, MAX_SESSION_NAME_CHARS);
+  }
   if (git !== undefined) active.git = git;
   active.model = omp.model(ctx);
   active.lastWrittenModel = active.model;

@@ -1,7 +1,7 @@
 /** Secure project allowlist edits for `/agentbridge allow|disallow`. */
 import type { Stats } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	type Config,
 	DEFAULT_CONFIG,
@@ -10,6 +10,7 @@ import {
 	writeFileAtomic,
 } from "@agentbridge/core";
 import { isPathInside } from "./autochat";
+import { CONFIG_TEXT } from "./messages";
 
 export type ProjectAction = "allow" | "disallow";
 
@@ -51,7 +52,7 @@ export async function inspectConfig(
 		return { kind: "insecure", configPath: path, reason: errorText(error) };
 	}
 	if (info.isSymbolicLink() || !info.isFile()) {
-		return { kind: "insecure", configPath: path, reason: "config phải là regular file, không phải symlink" };
+		return { kind: "insecure", configPath: path, reason: CONFIG_TEXT.notRegularFile };
 	}
 
 	let realPath: string;
@@ -68,10 +69,24 @@ export async function inspectConfig(
 	if (options.requireSecureMode !== false && process.platform !== "win32") {
 		const uid = process.getuid?.();
 		if (uid === undefined || info.uid !== uid || (info.mode & 0o777) !== 0o600) {
-			return { kind: "insecure", configPath: path, reason: "config phải có quyền 0600 và cùng uid" };
+			return { kind: "insecure", configPath: path, reason: CONFIG_TEXT.badMode };
 		}
 	}
 	return { kind: "ok", configPath: path, realPath, config: read.config, raw: read.raw };
+}
+
+/**
+ * A config entry as the loader sees it: absolute entries are realpath-ed (a
+ * missing path keeps its normalized form); relative entries are ignored by the
+ * loader, so they never match a project.
+ */
+async function canonicalProject(entry: string): Promise<string | undefined> {
+	if (!isAbsolute(entry)) return undefined;
+	try {
+		return await realpath(entry);
+	} catch {
+		return resolve(entry);
+	}
 }
 
 /** Real path for a config that may not exist yet: canonicalize the parent. */
@@ -86,6 +101,8 @@ async function canonicalConfigPath(configPath: string): Promise<string> {
 /** The autochat gate forbids keeping a config file inside any allowed project. */
 async function firstContainingProject(configRealPath: string, projects: string[]): Promise<string | undefined> {
 	for (const project of projects) {
+		// The loader ignores relative entries; so does this check.
+		if (!isAbsolute(project)) continue;
 		let realProject: string;
 		try {
 			realProject = await realpath(project);
@@ -101,7 +118,7 @@ async function firstContainingProject(configRealPath: string, projects: string[]
 async function ensureConfigParent(parent: string): Promise<void> {
 	try {
 		const info = await lstat(parent);
-		if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("thư mục config không an toàn");
+		if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(CONFIG_TEXT.unsafeParent);
 		return;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -128,12 +145,17 @@ export async function changeProjectConfig(options: {
 		return { kind: "insecure", configPath, reason: inspected.reason };
 	}
 
-	const present = inspected.kind === "ok" && inspected.config.projects.includes(options.project);
+	// Compare entries the way the loader resolves them (realpath, no trailing
+	// slash), so `disallow` also removes `/repo/` or a symlinked alias that would
+	// otherwise keep the project allowed at runtime.
+	const entries = inspected.kind === "ok" ? inspected.config.projects : [];
+	const canonical = await Promise.all(entries.map(canonicalProject));
+	const present = canonical.some((entry) => entry === options.project);
 	if (options.action === "allow" && present) {
 		return {
 			kind: "unchanged",
 			configPath,
-			projects: inspected.kind === "ok" ? inspected.config.projects : [],
+			projects: entries,
 			present: true,
 		};
 	}
@@ -141,18 +163,17 @@ export async function changeProjectConfig(options: {
 		return {
 			kind: "unchanged",
 			configPath,
-			projects: inspected.kind === "ok" ? inspected.config.projects : [],
+			projects: entries,
 			present: false,
 		};
 	}
 
 	const raw: Record<string, unknown> =
 		inspected.kind === "ok" ? { ...inspected.raw } : { ...DEFAULT_CONFIG, projects: [] };
-	const current = inspected.kind === "ok" ? inspected.config.projects : [];
 	const projects =
 		options.action === "allow"
-			? [...current, options.project]
-			: current.filter((project) => project !== options.project);
+			? [...entries, options.project]
+			: entries.filter((_, index) => canonical[index] !== options.project);
 
 	const configRealPath =
 		inspected.kind === "ok" ? inspected.realPath : await canonicalConfigPath(configPath);

@@ -21,13 +21,13 @@ import {
  type ChatConfig,
  type Config,
 } from "@agentbridge/core";
+import { AUTOCHAT_TEXT } from "./messages";
 
 /** Registered with OMP; value is `off`, `limited`, or `unlimited`. */
 export const AUTOCHAT_FLAG = "agentbridge-autochat";
 
 /** Shown whenever unlimited autochat is enabled, regardless of source. */
-export const AUTO_UNLIMITED_WARNING =
- "Claude có thể gửi tin và khiến OMP chạy tool không cần duyệt; quyền tool của OMP vẫn áp dụng";
+export const AUTO_UNLIMITED_WARNING = AUTOCHAT_TEXT.unlimitedWarning;
 
 /** TUI limited duration ceiling. */
 export const AUTOCHAT_LIMITED_MAX_MINUTES = 480;
@@ -71,9 +71,7 @@ export function readAutoApproveFlag(value: boolean | string | undefined): FlagAu
 }
 
 export function autoSourceLabel(source: AutoApproveSource): string {
- if (source === "config") return "config";
- if (source === "cli") return "CLI";
- return "lệnh TUI";
+ return AUTOCHAT_TEXT.source[source];
 }
 
 export interface AutoApproval {
@@ -115,11 +113,11 @@ export function clampAutoChatLimits(
 }
 
 export function autoLimitClampWarning(): string {
- return `AgentBridge: giới hạn autochat vượt mức an toàn; đã kẹp về autoMaxChars ≤ ${AUTO_MAX_CHARS_CAP}, autoMaxMessages ≤ ${AUTO_MAX_MESSAGES_CAP}, autoMinIntervalMs ≥ ${AUTO_MIN_INTERVAL_MS_FLOOR}.`;
+ return AUTOCHAT_TEXT.limitClamped(AUTO_MAX_CHARS_CAP, AUTO_MAX_MESSAGES_CAP, AUTO_MIN_INTERVAL_MS_FLOOR);
 }
 
 export function autoSentMessage(used: number, quota: number | undefined): string {
- return `AgentBridge: tự gửi tin từ Claude (${quota === undefined ? used : `${used}/${quota}`})`;
+ return AUTOCHAT_TEXT.sent(used, quota);
 }
 
 /** Count Unicode code points without allocating an array. */
@@ -238,17 +236,14 @@ export function autoConfigWarningMessage(
  reason: "inside-project" | "insecure",
  path: string,
 ): string {
- if (reason === "inside-project") {
-  return `AgentBridge: bỏ qua chat.autoApprove vì config nằm trong project (${path}); chuyển config ra ngoài project`;
- }
- return `AgentBridge: bỏ qua chat.autoApprove vì file config phải có quyền 0600 và cùng uid (${path})`;
+ return reason === "inside-project" ? AUTOCHAT_TEXT.configInsideProject(path) : AUTOCHAT_TEXT.configInsecure(path);
 }
 
 export function autoConfigEnabledMessage(
  mode: "limited" | "unlimited",
  path: string,
 ): string {
- return `AgentBridge: autochat ${mode} bật từ config ${path}`;
+ return AUTOCHAT_TEXT.enabledFromConfig(mode, path);
 }
 
 /**
@@ -308,7 +303,7 @@ export function bridgeStatusText(
 ): string {
  if (!chatEnabled || state.mode === "off") return base;
  if (state.mode === "limited") {
-  return `${base} · autochat ${state.used}/${state.quota ?? 0}`;
+  return AUTOCHAT_TEXT.statusLimited(base, state.used, state.quota ?? 0);
  }
- return `${base} · autochat ∞ · ${state.used} tin`;
+ return AUTOCHAT_TEXT.statusUnlimited(base, state.used);
 }

@@ -87,7 +87,7 @@ function makeProject(): string {
 
 function makeCtx(
 	cwd: string,
-	options: { kind?: string; select?: "yes" | "deny" | "cancel" | "unavailable" } = {},
+	options: { kind?: string; select?: "yes" | "deny" | "cancel" | "unavailable" | "omp-timeout" } = {},
 ): Ctx {
 	const selectMode = options.select ?? "yes";
 	const ui: OmpContextLike["ui"] = {
@@ -103,6 +103,12 @@ function makeCtx(
 			ctx.selections.push({ title, options, dialogOptions });
 			if (selectMode === "deny") return "Từ chối";
 			if (selectMode === "cancel") return undefined;
+			if (selectMode === "omp-timeout") {
+				// OMP 18.14 hook-selector: on timeout it calls onTimeout, then picks the highlighted item.
+				dialogOptions?.onTimeout?.();
+				const highlighted = options[dialogOptions?.initialIndex ?? 0];
+				return typeof highlighted === "string" ? highlighted : highlighted?.label;
+			}
 			return "Đồng ý";
 		};
 	}
@@ -210,6 +216,20 @@ test("disallow removes the canonical project and preserves unrelated fields", as
 	expect(updatedRest).toEqual(originalRest);
 });
 
+test("disallow removes non-canonical entries that still allow the project at runtime", async () => {
+	const env = setupEnv();
+	const project = makeProject();
+	const alias = join(env.root, "alias-link");
+	symlinkSync(project, alias);
+	writeConfig(env.config, { version: 1, projects: [`${project}/`, alias, "relative/keep"] });
+	const ctx = makeCtx(project);
+
+	await makeHost().command("disallow", ctx);
+
+	expect(readJson(env.config).projects).toEqual(["relative/keep"]);
+	expect(lastMessage(ctx)).toContain("đã bỏ cho phép");
+});
+
 test("duplicate allow and absent disallow do not rewrite the config", async () => {
 	const env = setupEnv();
 	const project = makeProject();
@@ -227,6 +247,19 @@ test("duplicate allow and absent disallow do not rewrite the config", async () =
 	await host.command("disallow", ctx);
 	expect(readFileSync(env.config, "utf8")).toBe(afterDisallow);
 	expect(lastMessage(ctx)).toContain("không có trong danh sách");
+});
+
+test("a confirmation that times out in OMP's selector never writes", async () => {
+	const env = setupEnv();
+	const project = makeProject();
+	const ctx = makeCtx(project, { select: "omp-timeout" });
+
+	await makeHost().command("allow", ctx);
+
+	expect(ctx.selections[0]?.dialogOptions?.initialIndex).toBe(1);
+	expect(ctx.selections[0]?.options[1]).toBe("Từ chối");
+	expect(existsSync(env.config)).toBe(false);
+	expect(lastMessage(ctx)).toContain("đã huỷ");
 });
 
 test("denied or cancelled confirmation never writes", async () => {

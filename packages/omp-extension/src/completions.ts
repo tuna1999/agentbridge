@@ -7,6 +7,8 @@
  * applyCompletion), so nested items must repeat the earlier tokens.
  */
 
+import { COMPLETION_TEXT } from "./messages";
+
 /** Structural subset of pi-tui `AutocompleteItem`. */
 export interface CompletionItem {
  value: string;
@@ -19,24 +21,18 @@ interface Choice {
  description: string;
 }
 
-export const AGENTBRIDGE_SUBCOMMANDS: readonly Choice[] = [
- { name: "status", description: "Trạng thái server, phiên và autochat" },
- { name: "trust", description: "Tin cậy phiên này (chỉ trong bộ nhớ)" },
- { name: "untrust", description: "Bỏ tin cậy phiên này" },
- { name: "autochat", description: "Chế độ tự duyệt: off | limited [phút] | unlimited" },
- { name: "allow", description: "Cho phép project hiện tại" },
- { name: "disallow", description: "Bỏ cho phép project hiện tại" },
- { name: "config", description: "Xem cấu hình AgentBridge" },
- { name: "off", description: "Tắt server cho phiên này" },
- { name: "on", description: "Bật lại server cho phiên này" },
- { name: "clear", description: "Xoá widget" },
-];
+const SUBCOMMAND_NAMES = ["status", "trust", "untrust", "autochat", "allow", "disallow", "config", "off", "on", "clear"] as const;
+const AUTOCHAT_MODE_NAMES = ["off", "limited", "unlimited"] as const;
 
-const AUTOCHAT_MODES: readonly Choice[] = [
- { name: "off", description: "Tắt autochat" },
- { name: "limited", description: "Tự duyệt có giới hạn, tuỳ chọn số phút (tối đa 480)" },
- { name: "unlimited", description: "Tự duyệt không giới hạn" },
-];
+export const AGENTBRIDGE_SUBCOMMANDS: readonly Choice[] = SUBCOMMAND_NAMES.map((name) => ({
+ name,
+ description: COMPLETION_TEXT.subcommands[name],
+}));
+
+const AUTOCHAT_MODES: readonly Choice[] = AUTOCHAT_MODE_NAMES.map((name) => ({
+ name,
+ description: COMPLETION_TEXT.autochatModes[name],
+}));
 
 function match(choices: readonly Choice[], typed: string, lead: string): CompletionItem[] | null {
  const lower = typed.toLowerCase();

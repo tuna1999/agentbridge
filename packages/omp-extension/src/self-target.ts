@@ -1,5 +1,5 @@
 /**
- * Self-target detection for consult/chat. Spec: 01 §7.6.
+ * Self-target detection for consult/chat. Spec: 01 §7.8.
  *
  * A caller is a self-target when its pid is OMP's pid, an ancestor of OMP, or
  * a descendant of OMP. The walk is bounded and tolerant of process races.

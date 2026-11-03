@@ -25,6 +25,7 @@ import {
  type ProgressBody,
  ProtocolError,
  redact,
+ sanitizeText,
  type Usage,
 } from "@agentbridge/protocol";
 import {
@@ -37,10 +38,11 @@ import {
 import {
  projectAllowed,
  RedactingDeltaStream,
- sanitizeDialogText,
  truncateUtf8,
  UNKNOWN_MODEL,
 } from "./consult";
+import { buildConsentView, callerLabel, paginateText, runPagedConsent, sanitizeDialogText } from "./consent";
+import { CHAT_TEXT, CONSENT_TEXT } from "./messages";
 import { type AutoApproval, MANUAL_CONSENT } from "./autochat";
 import {
  errorMessage,
@@ -54,26 +56,31 @@ import {
  type OmpTimer,
 } from "./omp";
 
-export const CHAT_SEND_OPTION = "Gửi";
-export const CHAT_DENY_OPTION = "Từ chối";
+export const CHAT_SEND_OPTION = CHAT_TEXT.send;
+export const CHAT_DENY_OPTION = CHAT_TEXT.deny;
 export const CHAT_CONSENT_OPTIONS: readonly string[] = [CHAT_SEND_OPTION, CHAT_DENY_OPTION];
-export const CHAT_VIEW_FULL_OPTION = "Xem toàn văn";
-export const CHAT_NEXT_PAGE_OPTION = "Trang sau";
-export const CHAT_CONSENT_TITLE = "AgentBridge: Claude Code muốn gửi tin vào phiên OMP";
-const CONSENT_SNIPPET_CHARS = 300;
-const CONSENT_MAX_LINES = 8;
-const VIEW_PAGE_CHARS = 1_000;
-const VIEW_PAGE_LINES = 14;
+export const CHAT_VIEW_FULL_OPTION = CONSENT_TEXT.viewFull;
+export const CHAT_NEXT_PAGE_OPTION = CONSENT_TEXT.nextPage;
+export const CHAT_CONSENT_TITLE = CHAT_TEXT.consentTitle;
 const CALLER_CHARS = 160;
 const ERROR_MESSAGE_CHARS = 500;
 
-/** Exact framing required by 01 §7.4b: the OMP model must see the source. */
+/**
+ * Exact framing required by 01 §7.4b: the OMP model must see the source. The
+ * caller id is self-declared, so it is kept to one line without brackets that
+ * could close the frame label early.
+ */
 export function buildChatFrame(message: string, callerSessionId: string): string {
- const caller = callerSessionId
-  .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
-  .slice(0, 128);
- return `[Tin nhắn từ Claude Code (phiên ${caller}), chuyển qua AgentBridge — không phải người dùng gõ]\n\n${message}`;
+ return CHAT_TEXT.frame(callerLabel(callerSessionId), message);
 }
+
+/** §5.3: the exact text the operator approves and OMP receives. */
+function chatPayload(message: string): string {
+ return redact(sanitizeText(message)).text;
+}
+
+/** Kept for the public extension API; pages come from the shared consent module. */
+export const paginateChatText = paginateText;
 
 function redactedError(error: unknown): string {
  return redact(errorMessage(error)).text.slice(0, ERROR_MESSAGE_CHARS);
@@ -136,66 +143,9 @@ function containsFrame(messages: readonly OmpAgentMessageLike[], frame: string):
  );
 }
 
-interface ChatConsentView {
- full: string;
- snippet: string;
- sizeLine: string;
- truncated: boolean;
-}
-
-/** Redacted + sanitized content the operator will actually see. */
-function buildChatConsentView(message: string): ChatConsentView {
- const redacted = redact(message).text;
- const full = sanitizeDialogText(redacted, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
- const snippet = sanitizeDialogText(full, CONSENT_SNIPPET_CHARS, CONSENT_MAX_LINES);
- const truncated = full.length > snippet.length;
- const lines = full.length === 0 ? 1 : full.split("\n").length;
- const hidden = truncated ? full.length - snippet.length : 0;
- const sizeLine = `Kích thước: ${lines} dòng · ${full.length} ký tự${truncated ? ` (đã ẩn ${hidden} ký tự)` : ""}`;
- return { full, snippet, sizeLine, truncated };
-}
-
-/**
- * Split sanitized full text without dropping anything. Pages keep line
- * boundaries where possible; a single overlong line is chunked by code point.
- */
-export function paginateChatText(
- text: string,
- maxChars: number = VIEW_PAGE_CHARS,
- maxLines: number = VIEW_PAGE_LINES,
-): string[] {
- if (maxChars <= 0 || maxLines <= 0) return [text];
- const pages: string[] = [];
- let current: string[] = [];
- let currentChars = 0;
- const flush = (): void => {
-  if (current.length === 0) return;
-  pages.push(current.join("\n"));
-  current = [];
-  currentChars = 0;
- };
-
- for (const rawLine of text.split("\n")) {
-  let points = Array.from(rawLine);
-  while (points.length > maxChars) {
-   flush();
-   pages.push(points.slice(0, maxChars).join(""));
-   points = points.slice(maxChars);
-  }
-  const line = points.join("");
-  const lineChars = points.length;
-  if (current.length > 0 && (current.length >= maxLines || currentChars + 1 + lineChars > maxChars)) {
-   flush();
-  }
-  current.push(line);
-  currentChars = current.length === 1 ? lineChars : currentChars + 1 + lineChars;
- }
- flush();
- return pages.length > 0 ? pages : [""];
-}
 
 function consentCaller(request: ChatRequest): string {
- return sanitizeDialogText(`${request.from.agent} · phiên ${request.from.sessionId}`, CALLER_CHARS);
+ return sanitizeDialogText(CHAT_TEXT.caller(request.from.agent, callerLabel(request.from.sessionId)), CALLER_CHARS, 1);
 }
 
 function chatConsentTitle(
@@ -205,13 +155,13 @@ function chatConsentTitle(
  page?: { index: number; total: number },
 ): string {
  const lines = [CHAT_CONSENT_TITLE, ""];
- if (page !== undefined) lines.push(`Trang ${page.index}/${page.total}`);
+ if (page !== undefined) lines.push(CONSENT_TEXT.page(page.index, page.total));
  lines.push(
   body,
   "",
   sizeLine,
-  `Caller: ${consentCaller(request)}`,
-  "Tin này sẽ hiện trong transcript OMP; OMP có thể chạy tool theo quyền của chính nó.",
+  CHAT_TEXT.callerLine(consentCaller(request)),
+  CHAT_TEXT.transcriptWarning,
  );
  return lines.join("\n");
 }
@@ -325,6 +275,8 @@ export class ChatManager {
    if (request.signal.aborted) {
     throw new ChatFailure("cancelled", "client disconnected before consent");
    }
+   // §5.3: what the operator approves (or autochat counts) is exactly what is sent.
+   const payload = chatPayload(request.body.message);
 
    const deferred = Promise.withResolvers<ChatResult>();
    // The timer may reject while consent is still awaiting; keep that
@@ -373,7 +325,7 @@ export class ChatManager {
    // the mandatory manual consent flow; session trust never applies to chat.
    let auto: AutoApproval | undefined;
    try {
-    auto = request.autoApprove?.(request.body.message, config);
+    auto = request.autoApprove?.(payload, config);
    } catch (error) {
     this.#report(current, error);
    }
@@ -383,7 +335,7 @@ export class ChatManager {
    } else {
     current.consent = MANUAL_CONSENT;
     this.#progress(request, { phase: "awaiting_consent" });
-    const choicePromise = this.#selectConsent(request, current);
+    const choicePromise = this.#selectConsent(request, current, payload);
     // If the host times out or the caller disconnects while the dialog is
     // open, stop waiting even if a UI implementation ignores AbortSignal.
     choicePromise.catch(() => undefined);
@@ -410,7 +362,7 @@ export class ChatManager {
     throw new ChatFailure("busy", "OMP became busy and chat.queueWhenBusy is false");
    }
 
-   const frame = buildChatFrame(redact(request.body.message).text, request.from.sessionId);
+   const frame = buildChatFrame(payload, request.from.sessionId);
    current.frame = frame;
    current.sentWhileIdle = !busy;
    current.stream = new RedactingDeltaStream((delta) => {
@@ -538,7 +490,7 @@ export class ChatManager {
     return;
    }
 
-   const redacted = redact(messageText(assistant));
+   const redacted = redact(sanitizeText(messageText(assistant)));
    const limited = truncateUtf8(redacted.text, pending.replyMaxBytes);
    const result: ChatResult = {
     replyText: limited.text,
@@ -579,49 +531,26 @@ export class ChatManager {
   );
  }
 
- async #selectConsent(request: ChatRequest, pending: PendingChat): Promise<string | undefined> {
-  const view = buildChatConsentView(request.body.message);
-  // One deadline covers the snippet dialog and every full-text page.
+ /**
+  * Snippet dialog, then "Xem toàn văn" pages when the snippet hides anything;
+  * Gửi is only offered on the last page. One deadline covers every dialog.
+  */
+ async #selectConsent(
+  request: ChatRequest,
+  pending: PendingChat,
+  payload: string,
+ ): Promise<string | undefined> {
+  const view = buildConsentView(payload);
   pending.consentDeadline = Date.now() + pending.consentTimeoutMs;
-  this.#assertConsentTime(pending);
-
-  if (!view.truncated) {
-   return this.#selectDialog(
-    request,
-    pending,
-    chatConsentTitle(request, view.snippet, view.sizeLine),
-    [...CHAT_CONSENT_OPTIONS],
-   );
-  }
-
-  // The snippet is not the whole message: no Gửi option yet.
-  const initial = await this.#selectDialog(
-   request,
-   pending,
-   chatConsentTitle(request, view.snippet, view.sizeLine),
-   [CHAT_VIEW_FULL_OPTION, CHAT_DENY_OPTION],
-  );
-  if (initial !== CHAT_VIEW_FULL_OPTION) return initial;
-
-  const pages = paginateChatText(view.full);
-  for (let index = 0; index < pages.length; index += 1) {
-   this.#assertConsentTime(pending);
-   const last = index === pages.length - 1;
-   const page = { index: index + 1, total: pages.length };
-   const choice = await this.#selectDialog(
-    request,
-    pending,
-    chatConsentTitle(request, pages[index] ?? "", view.sizeLine, page),
-    last ? [...CHAT_CONSENT_OPTIONS] : [CHAT_NEXT_PAGE_OPTION, CHAT_DENY_OPTION],
-   );
-   if (choice === CHAT_SEND_OPTION && last) return CHAT_SEND_OPTION;
-   if (choice === CHAT_DENY_OPTION) return CHAT_DENY_OPTION;
-   if (choice === CHAT_NEXT_PAGE_OPTION && !last) continue;
-   if (choice === undefined) return undefined;
-   // Unknown option or Gửi before the final page: treat as refusal.
-   return CHAT_DENY_OPTION;
-  }
-  return CHAT_DENY_OPTION;
+  return runPagedConsent({
+   view,
+   title: (body, page) => chatConsentTitle(request, body, view.sizeLine, page),
+   finalOptions: CHAT_CONSENT_OPTIONS,
+   denyOption: CHAT_DENY_OPTION,
+   beforeDialog: () => this.#assertConsentTime(pending),
+   expired: () => this.#consentExpired(pending),
+   select: (title, options, initialIndex) => this.#selectDialog(request, pending, title, options, initialIndex),
+  });
  }
 
  async #selectDialog(
@@ -629,11 +558,13 @@ export class ChatManager {
   pending: PendingChat,
   title: string,
   options: readonly string[],
+  initialIndex: number,
  ): Promise<string | undefined> {
   try {
    return await this.#omp.select(request.ctx, title, [...options], {
     timeout: dialogTimeout(pending),
     signal: pending.abort.signal,
+    initialIndex,
    });
   } catch (error) {
    if (pending.settled) throw pending.failure ?? new ChatFailure("cancelled", "chat cancelled");
@@ -735,7 +666,8 @@ export class ChatManager {
    from: { agent: request.from.agent, sessionId: request.from.sessionId },
    to: { sessionId: request.sessionId },
    project: request.project,
-   question: redact(request.body.message).text,
+   // Hash/size what was received, as consult does; content (if enabled) is redacted by appendAudit.
+   question: request.body.message,
    durationMs,
    outcome,
   };

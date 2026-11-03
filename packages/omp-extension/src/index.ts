@@ -9,6 +9,7 @@ import packageJson from "../package.json";
 import { AUTOCHAT_FLAG } from "./autochat";
 import { agentbridgeArgumentCompletions } from "./completions";
 import { Host } from "./lifecycle";
+import { EXTENSION_TEXT } from "./messages";
 import {
  type OmpAgentEndLike,
  type OmpContextLike,
@@ -93,8 +94,7 @@ export default function agentbridgeExtension(pi: PiLike): void {
  // absent flag remains distinguishable from an explicit "off".
  try {
   pi.registerFlag?.(AUTOCHAT_FLAG, {
-   description:
-    "AgentBridge autochat: off | limited | unlimited (TUI command overrides this; config is the fallback)",
+   description: EXTENSION_TEXT.autochatFlag,
    type: "string",
   });
  } catch {
@@ -188,7 +188,7 @@ export default function agentbridgeExtension(pi: PiLike): void {
  });
 
  pi.registerCommand("agentbridge", {
-  description: "AgentBridge: status, trust, untrust, autochat, allow, disallow, config, off, on, clear",
+  description: EXTENSION_TEXT.command,
   getArgumentCompletions: agentbridgeArgumentCompletions,
   handler: async (args: string, ctx: OmpContextLike) => {
    try {

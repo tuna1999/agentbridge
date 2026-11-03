@@ -4,12 +4,14 @@
  * that is still in flight (`spike/RESULTS.md`, G3).
  */
 import type { ConsultAttachment } from "@agentbridge/protocol";
+import { callerLabel } from "./consent";
 
 const CALLER_LABEL = "Claude Code";
 const SHORT_SESSION_CHARS = 8;
 
 function shortSession(sessionId: string): string {
- return sessionId.length > SHORT_SESSION_CHARS ? sessionId.slice(0, SHORT_SESSION_CHARS) : sessionId;
+ const label = callerLabel(sessionId);
+ return label.length > SHORT_SESSION_CHARS ? label.slice(0, SHORT_SESSION_CHARS) : label;
 }
 
 /** Longest run of backticks in `text`; the fence must be longer so it cannot close early. */
@@ -30,7 +32,8 @@ function languageOf(path: string): string {
  return /^[a-z0-9+#._-]+$/.test(extension) ? extension : "text";
 }
 
-function locationOf(attachment: ConsultAttachment): string {
+/** `path:start-end`, `path:start` or `path`; shared with the consent dialog. */
+export function locationOf(attachment: ConsultAttachment): string {
  const { path, startLine, endLine } = attachment;
  if (startLine !== undefined && endLine !== undefined) return `${path}:${startLine}-${endLine}`;
  if (startLine !== undefined) return `${path}:${startLine}`;

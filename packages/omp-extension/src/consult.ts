@@ -19,6 +19,8 @@ import {
  ProtocolError,
  type Usage,
  redact,
+ sanitizeLabel,
+ sanitizeText,
 } from "@agentbridge/protocol";
 import {
  type AuditEvent,
@@ -39,63 +41,22 @@ import {
  type OmpSelectItem,
  errorMessage,
 } from "./omp";
-import { buildPrompt } from "./prompt";
+import { buildConsentView, callerLabel, runPagedConsent, sanitizeDialogText } from "./consent";
+import { CONSENT_TEXT, CONSULT_TEXT } from "./messages";
+import { buildPrompt, locationOf } from "./prompt";
 
 /** Choices offered by `ctx.ui.select`; the API returns the selected label. */
 export const CONSENT_OPTIONS: readonly string[] = [
- "Cho phép lần này",
- "Cho phép trong phiên này",
- "Từ chối",
+ CONSULT_TEXT.allowOnce,
+ CONSULT_TEXT.allowSession,
+ CONSULT_TEXT.deny,
 ];
-export const CONSENT_TITLE = "AgentBridge: Claude Code muốn hỏi ý kiến";
-const CONSENT_SNIPPET_CHARS = 300;
-const CONSENT_MAX_LINES = 8;
+export const CONSENT_TITLE = CONSULT_TEXT.consentTitle;
 const CONSENT_SESSION_CHARS = 128;
-
-/**
- * C0/C1 controls (except `\n`, which carries the line structure) and bidi
- * controls, which can visually reorder otherwise honest text.
- */
-const DIALOG_CONTROL_CHARS = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
-const DIALOG_BIDI_OVERRIDES = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
-/** CSI, OSC and two-character ESC sequences; their payload must never render. */
-const ANSI_ESCAPE_SEQUENCES =
- /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\)|[@-_])|\u009b[0-?]*[ -/]*[@-~]/g;
-
-/**
- * Remove terminal escapes, C0/C1 controls (newlines survive for line layout)
- * and bidi controls from untrusted text.
- */
-function stripUnsafeText(text: string): string {
- return text
-  .replace(ANSI_ESCAPE_SEQUENCES, "")
-  .replace(DIALOG_CONTROL_CHARS, "")
-  .replace(DIALOG_BIDI_OVERRIDES, "");
-}
-
-/**
- * Make untrusted text safe to show in `ctx.ui.select`: no terminal escapes, no
- * invisible reordering, at most one blank line in a row, at most `maxLines`
- * lines, and only then a character cap.
- */
-export function sanitizeDialogText(
- text: string,
- maxChars: number = Number.POSITIVE_INFINITY,
- maxLines: number = CONSENT_MAX_LINES,
-): string {
- const cleaned = stripUnsafeText(text);
- const lines: string[] = [];
- for (const raw of cleaned.split("\n")) {
-  const line = raw.replace(/\s+$/u, "");
-  const previousBlank = lines.length === 0 || lines[lines.length - 1] === "";
-  if (line.length === 0 && previousBlank) continue;
-  lines.push(line);
-  if (lines.length === maxLines) break;
- }
- while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
- const bounded = lines.join("\n");
- return bounded.length > maxChars ? bounded.slice(0, maxChars) : bounded;
-}
+/** Attachment locations listed in the consent dialog before "… và K tệp khác". */
+const CONSENT_MAX_ATTACHMENTS = 10;
+/** Attachment paths come from the caller; keep them to one bounded line. */
+const ATTACHMENT_PATH_CHARS = 512;
 
 export interface ConsultRequest {
  ctx: OmpContextLike;
@@ -203,21 +164,44 @@ function usageOf(result: OmpEphemeralResult): Usage | undefined {
  return pickUsage(result.assistantMessage?.usage);
 }
 
-function consentTitle(request: ConsultRequest, question: string): string {
- const cleanQuestion = sanitizeDialogText(question);
- const snippet =
-  cleanQuestion.length > CONSENT_SNIPPET_CHARS
-   ? `${cleanQuestion.slice(0, CONSENT_SNIPPET_CHARS)}…`
-   : cleanQuestion;
- const callerSession = sanitizeDialogText(request.from.sessionId, CONSENT_SESSION_CHARS);
- const attachmentCount = request.body.attachments?.length ?? 0;
- return [
-  CONSENT_TITLE,
-  "",
-  snippet,
-  "",
-  `Đính kèm: ${attachmentCount} · caller session: ${callerSession}`,
- ].join("\n");
+/**
+ * §5.3: the exact question and attachments the model will receive. Sanitized
+ * first so a secret split by an invisible character is still redacted, then
+ * redacted again on the host (defense in depth; the caller redacts too).
+ */
+function consultPayload(body: ConsultBody): { question: string; attachments: ConsultAttachment[] } {
+ const question = redact(sanitizeText(body.question)).text;
+ const attachments = (body.attachments ?? []).map((attachment) => {
+  const clean: ConsultAttachment = {
+   path: sanitizeLabel(attachment.path, ATTACHMENT_PATH_CHARS),
+   text: redact(sanitizeText(attachment.text)).text,
+  };
+  if (attachment.startLine !== undefined) clean.startLine = attachment.startLine;
+  if (attachment.endLine !== undefined) clean.endLine = attachment.endLine;
+  return clean;
+ });
+ return { question, attachments };
+}
+
+function consentTitle(
+ request: ConsultRequest,
+ attachments: readonly ConsultAttachment[],
+ sizeLine: string,
+ body: string,
+ page?: { index: number; total: number },
+): string {
+ const callerSession = sanitizeDialogText(callerLabel(request.from.sessionId), CONSENT_SESSION_CHARS, 1);
+ const lines = [CONSENT_TITLE, ""];
+ if (page !== undefined) lines.push(CONSENT_TEXT.page(page.index, page.total));
+ if (body.length > 0) lines.push(body, "");
+ lines.push(sizeLine, CONSULT_TEXT.attachmentsLine(attachments.length, callerSession));
+ for (const attachment of attachments.slice(0, CONSENT_MAX_ATTACHMENTS)) {
+  lines.push(CONSULT_TEXT.attachmentItem(sanitizeDialogText(locationOf(attachment), 160, 1)));
+ }
+ if (attachments.length > CONSENT_MAX_ATTACHMENTS) {
+  lines.push(CONSULT_TEXT.moreAttachments(attachments.length - CONSENT_MAX_ATTACHMENTS));
+ }
+ return lines.join("\n");
 }
 
 /** Token bucket; `ratePerMinute` is both refill rate and burst capacity. */
@@ -277,20 +261,64 @@ class RequestDedupe {
 const DELTA_FLUSH_BYTES = 4 * 1024;
 /** A PEM header means the following lines are key material; deltas stop there. */
 const PEM_HEADER = "-----BEGIN";
+/** Secret-assignment names (§5.1), matched at the end of a ≤ 12-character window. */
+const KEYWORD_AT_END = /(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)$/i;
+const KEYWORD_WINDOW = 12;
+/**
+ * Upper bound for held text (and for the backwards scan). A real key and its
+ * value are never kilobytes apart; without a bound, a name followed by an
+ * endless run of blank lines would be rescanned on every delta.
+ */
+const MAX_HELD_CHARS = 4 * 1024;
+
+function isSpaceOrQuote(char: string): boolean {
+ const code = char.charCodeAt(0);
+ if (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x22 || code === 0x27) return true;
+ return code > 0x7f && /\s/.test(char);
+}
+
+/**
+ * Index of a secret-assignment name that the text up to `end` ends with —
+ * `name`, `name:`, `"name": "` … — skipping trailing whitespace, quotes and
+ * one `:`/`=`; -1 when there is none. Linear in the skipped run, no regex
+ * backtracking. The name may sit inside a value (`admin_password`), which is
+ * why callers hold whole lines, not just the name.
+ */
+function openAssignmentStart(text: string, end: number): number {
+ const floor = Math.max(0, end - MAX_HELD_CHARS);
+ let index = end;
+ let separator = false;
+ while (index > floor) {
+  const char = text.charAt(index - 1);
+  if (isSpaceOrQuote(char)) index -= 1;
+  else if (!separator && (char === ":" || char === "=")) {
+   separator = true;
+   index -= 1;
+  } else break;
+ }
+ if (index === floor && floor > 0) return -1;
+ const window = text.slice(Math.max(0, index - KEYWORD_WINDOW), index);
+ const match = KEYWORD_AT_END.exec(window);
+ return match === null ? -1 : index - window.length + match.index;
+}
 
 /**
  * Stream deltas to the caller without ever emitting an un-redacted chunk.
  *
  * A secret split across two chunks (`"api_key="` + `"sk-…\n"`) is only
  * recognisable as a whole line, so deltas are buffered until a `\n` arrives and
- * every completed line goes through `redact()`. An overlong unterminated tail
- * is flushed up to its last whitespace (redacted first). Once a line contains a
- * PEM header the rest of the turn is muted, because a multi-line key block can
- * never be redacted line by line. The final result still carries the full
- * redacted reply; the unterminated tail is deliberately never streamed.
+ * every completed line goes through `redact()`. A chunk that ends in an open
+ * assignment (`password:`) keeps that tail pending until its value arrives, even
+ * across a newline. An overlong unterminated tail is flushed up to its last
+ * whitespace under the same rule. Once a line contains a PEM header the rest of
+ * the turn is muted, because a multi-line key block can never be redacted line
+ * by line. Emitted text is also `sanitizeText`ed (§5.3). The final result still
+ * carries the full redacted reply; the unterminated tail is never streamed.
  */
 export class RedactingDeltaStream {
  #pending = "";
+ /** A trailing `\r` waits for the next delta: `\r` + `\n` must become one newline. */
+ #carry = "";
  #muted = false;
  readonly #send: (delta: string) => void;
 
@@ -300,14 +328,17 @@ export class RedactingDeltaStream {
 
  push(delta: string): void {
   if (this.#muted || delta.length === 0) return;
-  this.#pending += delta;
-  while (true) {
-   const newline = this.#pending.indexOf("\n");
-   if (newline < 0) break;
-   const line = this.#pending.slice(0, newline + 1);
-   this.#pending = this.#pending.slice(newline + 1);
-   this.#emit(line);
+  // Sanitize first so the open-assignment check sees what will be emitted.
+  const raw = this.#carry + delta;
+  this.#carry = raw.endsWith("\r") ? "\r" : "";
+  this.#pending += sanitizeText(this.#carry === "" ? raw : raw.slice(0, -1));
+  const lastNewline = this.#pending.lastIndexOf("\n");
+  if (lastNewline >= 0) {
+   const complete = this.#pending.slice(0, lastNewline + 1);
+   const rest = this.#pending.slice(lastNewline + 1);
+   const held = this.#release(complete);
    if (this.#muted) return;
+   this.#pending = held + rest;
   }
   if (Buffer.byteLength(this.#pending, "utf8") > DELTA_FLUSH_BYTES) this.#flushToWhitespace();
  }
@@ -318,18 +349,59 @@ export class RedactingDeltaStream {
   const lastWhitespace = /\s\S*$/.exec(this.#pending);
   if (lastWhitespace === null) return;
   const chunk = this.#pending.slice(0, lastWhitespace.index + 1);
-  this.#pending = this.#pending.slice(lastWhitespace.index + 1);
-  this.#emit(chunk);
+  const rest = this.#pending.slice(lastWhitespace.index + 1);
+  const held = this.#release(chunk);
+  if (this.#muted) return;
+  this.#pending = held + rest;
  }
 
- #emit(text: string): void {
-  if (this.#muted || text.length === 0) return;
-  if (text.includes(PEM_HEADER)) {
+ /**
+  * Emit `text` except a trailing open assignment, which is returned to stay
+  * pending. The hold starts at the whitespace-delimited token that holds the
+  * name, then moves back over `:`/`=`/whitespace while the text before it
+  * ends in another name: a name can end a value (`api_key: my_api_key`,
+  * `DB_PASSWORD=admin_password`) or a value can sit on the next line
+  * (`password:` ⏎ value), and the key must be redacted together with its value.
+  * Held text is bounded by `MAX_HELD_CHARS`. Lines before a PEM header are
+  * emitted, then the stream is muted.
+  */
+ #release(text: string): string {
+  const floor = Math.max(0, text.length - MAX_HELD_CHARS);
+  let cut = text.length;
+  let name = openAssignmentStart(text, cut);
+  while (name >= 0) {
+   cut = name;
+   while (cut > floor && !isSpaceOrQuote(text.charAt(cut - 1))) cut -= 1;
+   if (cut <= floor && floor > 0) {
+    // Longer than the bound: holding would only delay the stream.
+    cut = text.length;
+    break;
+   }
+   name = openAssignmentStart(text, cut);
+  }
+  const ready = text.slice(0, cut);
+  const pem = ready.indexOf(PEM_HEADER);
+  if (pem >= 0) {
+   this.#emit(ready.slice(0, ready.lastIndexOf("\n", pem) + 1));
    this.#muted = true;
    this.#pending = "";
-   return;
+   return "";
   }
-  this.#send(redact(text).text);
+  this.#emit(ready);
+  return text.slice(cut);
+ }
+
+ /** Redact the whole chunk (a pair may span lines), then send one delta per line. */
+ #emit(text: string): void {
+  if (this.#muted || text.length === 0) return;
+  const clean = redact(sanitizeText(text)).text;
+  let start = 0;
+  while (start < clean.length) {
+   const newline = clean.indexOf("\n", start);
+   const end = newline < 0 ? clean.length : newline + 1;
+   this.#send(clean.slice(start, end));
+   start = end;
+  }
  }
 }
 
@@ -362,7 +434,7 @@ function scheduleWidgetTimer(callback: () => void, ms: number): WidgetTimer {
 
 /** One sanitized, width-bounded widget line. */
 function widgetLine(text: string, maxChars: number = WIDGET_LINE_CHARS): string {
- const clean = stripUnsafeText(text).replace(/[\r\n]+/g, " ");
+ const clean = sanitizeText(text).replace(/\t/g, "  ").replace(/\n+/g, " ");
  return clean.length > maxChars ? `${clean.slice(0, maxChars - 1)}…` : clean;
 }
 
@@ -508,6 +580,9 @@ export class ConsultManager {
    // 6. claim the single slot
    this.#inFlight += 1;
    try {
+    // §5.3: one sanitized + redacted payload for the dialog, widget and prompt.
+    const payload = consultPayload(request.body);
+
     // 7. consent
     const mode = request.isTrusted() ? "always" : config.consult.consent;
     if (mode === "deny") {
@@ -515,7 +590,7 @@ export class ConsultManager {
     }
     if (mode === "ask" || mode === "session") {
      request.sendProgress({ phase: "awaiting_consent" });
-     const choice = await this.#selectConsent(request, config, request.body.question);
+     const choice = await this.#selectConsent(request, config, payload);
      if (request.signal.aborted) {
       throw new ConsultFailure("cancelled", "client disconnected during consent");
      }
@@ -538,10 +613,10 @@ export class ConsultManager {
     request.sendProgress({ phase: "running" });
     // Display-only: after consent, the widget shows the question and the
     // redacted delta stream. It never touches the session or LLM context.
-    if (config.ui.liveWidget) widget = this.#beginWidget(request, config.ui);
+    if (config.ui.liveWidget) widget = this.#beginWidget(request, payload.question, config.ui);
 
     // 9. prompt
-    const prompt = buildPrompt(request.body.question, attachments, request.from.sessionId);
+    const prompt = buildPrompt(payload.question, payload.attachments, request.from.sessionId);
 
     // 10. options
     const limitReply = request.body.limits?.replyMaxBytes;
@@ -596,8 +671,8 @@ export class ConsultManager {
      }
     }
 
-    // 12. redact and shape the result
-    const redacted = redact(typeof result.replyText === "string" ? result.replyText : "");
+    // 12. sanitize (§5.3), redact and shape the result
+    const redacted = redact(sanitizeText(typeof result.replyText === "string" ? result.replyText : ""));
     const limited = truncateUtf8(redacted.text, replyMaxBytes);
     const replyText = limited.text;
     // OMP can drop the model after the turn ran; an unknown label must not discard the reply.
@@ -608,15 +683,11 @@ export class ConsultManager {
     const durationMs = Date.now() - startedAt;
     outcome = "ok";
     if (widget !== undefined) {
-     this.#finalizeWidget(widget, `✓ đã trả lời Claude (${durationMs}ms)`);
+     this.#finalizeWidget(widget, CONSULT_TEXT.widgetDone(durationMs));
     }
 
     // 13. notify (best-effort inside the adapter)
-    this.#omp.notify(
-     request.ctx,
-     `AgentBridge: đã trả lời Claude (${durationMs}ms)`,
-     "info",
-    );
+    this.#omp.notify(request.ctx, CONSULT_TEXT.answered(durationMs), "info");
 
     return {
      replyText,
@@ -643,7 +714,7 @@ export class ConsultManager {
     auditEvent = "error";
     outcome = "internal";
    }
-   if (widget !== undefined) this.#finalizeWidget(widget, `✗ ${code}`);
+   if (widget !== undefined) this.#finalizeWidget(widget, CONSULT_TEXT.widgetFailed(code));
    throw error;
   } finally {
    if (config !== undefined) {
@@ -662,16 +733,16 @@ export class ConsultManager {
   }
  }
 
- #beginWidget(request: ConsultRequest, ui: UiConfig): LiveWidgetState {
+ #beginWidget(request: ConsultRequest, questionText: string, ui: UiConfig): LiveWidgetState {
   this.#disposeWidget();
-  const caller = widgetLine(request.from.sessionId, WIDGET_CALLER_CHARS);
-  const question = widgetQuestionLines(request.body.question);
+  const caller = widgetLine(callerLabel(request.from.sessionId), WIDGET_CALLER_CHARS);
+  const question = widgetQuestionLines(questionText);
   const state: LiveWidgetState = {
    ctx: request.ctx,
    question,
    tail: new WidgetStreamTail(widgetTailLineLimit(ui.widgetLines, question.length)),
    holdMs: ui.widgetHoldMs,
-   header: `◆ AgentBridge · Claude đang hỏi · ${caller}`,
+   header: CONSULT_TEXT.widgetHeader(caller),
    lastRenderAt: Date.now(),
    finished: false,
   };
@@ -752,28 +823,43 @@ export class ConsultManager {
   }
  }
 
+ /**
+  * §7.4 step 7: snippet dialog, then "Xem toàn văn" pages when the snippet
+  * hides anything; approval is only offered once everything was shown.
+  * `consentTimeoutMs` is one deadline shared by every dialog.
+  */
  async #selectConsent(
   request: ConsultRequest,
   config: Config,
-  question: string,
+  payload: { question: string; attachments: ConsultAttachment[] },
  ): Promise<string | undefined> {
-  const dialogOptions: OmpDialogOptions = {
-   timeout: config.consult.consentTimeoutMs,
-   signal: request.signal,
-  };
-  try {
-   return await this.#omp.select(
-    request.ctx,
-    consentTitle(request, question),
-    [...CONSENT_OPTIONS] as OmpSelectItem[],
-    dialogOptions,
-   );
-  } catch (error) {
-   if (request.signal.aborted) {
-    throw new ConsultFailure("cancelled", "client disconnected during consent");
-   }
-   throw new ConsultFailure("internal", `ui.select failed: ${redactedMessage(error)}`, "error");
-  }
+  const view = buildConsentView(payload.question);
+  const deadline = Date.now() + config.consult.consentTimeoutMs;
+  return runPagedConsent({
+   view,
+   title: (body, page) => consentTitle(request, payload.attachments, view.sizeLine, body, page),
+   finalOptions: CONSENT_OPTIONS,
+   denyOption: CONSULT_TEXT.deny,
+   beforeDialog: () => {
+    if (Date.now() >= deadline) throw new ConsultFailure("consent_timeout", "consent dialog timed out");
+   },
+   expired: () => Date.now() >= deadline,
+   select: async (title, options, initialIndex) => {
+    const dialogOptions: OmpDialogOptions = {
+     timeout: Math.max(1, deadline - Date.now()),
+     signal: request.signal,
+     initialIndex,
+    };
+    try {
+     return await this.#omp.select(request.ctx, title, options as OmpSelectItem[], dialogOptions);
+    } catch (error) {
+     if (request.signal.aborted) {
+      throw new ConsultFailure("cancelled", "client disconnected during consent");
+     }
+     throw new ConsultFailure("internal", `ui.select failed: ${redactedMessage(error)}`, "error");
+    }
+   },
+  });
  }
 
  async #record(

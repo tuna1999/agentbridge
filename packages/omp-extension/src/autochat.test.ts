@@ -67,8 +67,14 @@ function makeCtx(root: string, sessionId = "omp-auto-test"): Ctx {
 				ctx.notifications.push([message, type]);
 			},
 			async select(title, options) {
-				ctx.selections.push({ title, options });
-				return "Gửi";
+				// Act like an operator who reads every page and then sends. Only the
+				// first dialog of a request is recorded, so `selections` counts the
+				// requests that fell back to manual consent.
+				const labels = options.map((option) => (typeof option === "string" ? option : option.label));
+				if (!/^Trang \d+\/\d+$/m.test(title)) ctx.selections.push({ title, options });
+				if (labels.includes("Gửi")) return "Gửi";
+				if (labels.includes("Xem toàn văn")) return "Xem toàn văn";
+				return "Trang sau";
 			},
 		},
 		mode: "tui",
