@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
 	runInstaller,
 	SAMPLE_CONFIG,
 	sha256File,
+	StdinClosedError,
 } from "./install";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -75,6 +76,11 @@ function installerEnv(): Record<string, string> {
 	delete env.AGENTBRIDGE_CONFIG;
 	delete env.AGENTBRIDGE_STATE_DIR;
 	delete env.AGENTBRIDGE_RUNTIME_DIR;
+	// OMP agent-dir overrides on the developer machine must not move the extension.
+	delete env.PI_CODING_AGENT_DIR;
+	delete env.PI_CONFIG_DIR;
+	delete env.OMP_PROFILE;
+	delete env.PI_PROFILE;
 	env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
 	env.AB_CLAUDE_MARKER = marker;
 	return env;
@@ -408,5 +414,165 @@ describe("installer --apply", () => {
 		expect(fake.output()).toContain("AGENTBRIDGE_HOME trùng thư mục home");
 		expect(existsSync(configFile)).toBe(true);
 		expect(existsSync(home)).toBe(true);
+	});
+});
+
+describe("installer safety", () => {
+	test("refuses an AGENTBRIDGE_HOME that is the real path behind a symlinked HOME", async () => {
+		const realHome = join(root, "real-home");
+		await mkdir(join(realHome, ".ssh"), { recursive: true });
+		await writeFile(join(realHome, ".ssh", "id_ed25519"), "key\n");
+		await writeFile(join(realHome, "config.json"), '{"version":1,"projects":[]}\n');
+		const aliasHome = join(root, "alias-home");
+		await symlink(realHome, aliasHome);
+		const env = { ...installerEnv(), HOME: aliasHome, AGENTBRIDGE_HOME: realHome };
+
+		const fake = fakeIO();
+		const code = await runInstaller({ apply: true, uninstall: true, repoRoot: REPO_ROOT, env, io: fake.io });
+
+		expect(code).toBe(0);
+		expect(fake.output()).toContain("AGENTBRIDGE_HOME trùng thư mục home");
+		expect(existsSync(join(realHome, ".ssh", "id_ed25519"))).toBe(true);
+		expect(existsSync(join(realHome, "config.json"))).toBe(true);
+	});
+
+	test("a mistaken AGENTBRIDGE_HOME keeps every file that AgentBridge did not write", async () => {
+		const foreign = join(root, "dot-claude");
+		await mkdir(join(foreign, "state"), { recursive: true });
+		await writeFile(join(foreign, "settings.json"), '{"theme":"dark"}\n');
+		await writeFile(join(foreign, "config.json"), '{"theme":"dark"}\n');
+		await writeFile(join(foreign, "state", "other.txt"), "keep\n");
+		const env = { ...installerEnv(), AGENTBRIDGE_HOME: foreign };
+
+		const fake = fakeIO();
+		const code = await runInstaller({ apply: true, uninstall: true, repoRoot: REPO_ROOT, env, io: fake.io });
+
+		expect(code).toBe(0);
+		expect(await tree(foreign)).toEqual(["config.json", "settings.json", "state/", "state/other.txt"]);
+		expect(fake.output()).toContain("còn file không phải của AgentBridge");
+	});
+
+	test("a foreign config.json that merely has a projects field is kept", async () => {
+		const foreign = join(root, "other-app");
+		await mkdir(foreign, { recursive: true });
+		await writeFile(join(foreign, "config.json"), '{"projects":["a"],"theme":"dark"}\n');
+		const env = { ...installerEnv(), AGENTBRIDGE_HOME: foreign };
+
+		const code = await runInstaller({ apply: true, uninstall: true, repoRoot: REPO_ROOT, env, io: fakeIO().io });
+
+		expect(code).toBe(0);
+		expect(existsSync(join(foreign, "config.json"))).toBe(true);
+	});
+
+	test("install never re-modes the user's HOME used as AGENTBRIDGE_HOME", async () => {
+		await chmod(home, 0o755);
+		const env = { ...installerEnv(), AGENTBRIDGE_HOME: home };
+		const fake = fakeIO((question) => question.includes("Tạo config mẫu"));
+
+		const code = await runInstaller({ apply: true, uninstall: false, repoRoot: REPO_ROOT, env, io: fake.io });
+
+		expect(code).toBe(0);
+		expect((await stat(home)).mode & 0o777).toBe(0o755);
+		expect(fake.output()).toContain("không tự đổi quyền");
+		expect(existsSync(join(home, "config.json"))).toBe(true);
+	});
+
+	test("an empty or chat-only config is recognized as AgentBridge's own", async () => {
+		const abHome = join(home, ".agentbridge");
+		await mkdir(abHome, { recursive: true, mode: 0o700 });
+		await writeFile(join(abHome, "config.json"), '{"chat":{"enabled":true}}\n');
+
+		const fake = fakeIO();
+		const code = await runInstaller({ apply: true, uninstall: true, repoRoot: REPO_ROOT, env: installerEnv(), io: fake.io });
+
+		expect(code).toBe(0);
+		expect(existsSync(abHome)).toBe(false);
+	});
+
+	test("uninstall removes a complete AgentBridge home including registry files", async () => {
+		const abHome = join(home, ".agentbridge");
+		await mkdir(join(abHome, "state"), { recursive: true, mode: 0o700 });
+		await mkdir(join(abHome, "run", "sessions"), { recursive: true, mode: 0o700 });
+		await mkdir(join(abHome, "run", "s"), { recursive: true, mode: 0o700 });
+		await writeFile(join(abHome, "config.json"), '{"version":1,"projects":["/x"]}\n');
+		await writeFile(join(abHome, "state", "audit.jsonl"), "{}\n");
+		await writeFile(join(abHome, "state", "audit.jsonl.1"), "{}\n");
+		await writeFile(join(abHome, "run", "sessions", "omp-abc.json"), "{}");
+		await writeFile(join(abHome, "run", "sessions", "omp-abc.token"), "t");
+
+		const fake = fakeIO();
+		const code = await runInstaller({ apply: true, uninstall: true, repoRoot: REPO_ROOT, env: installerEnv(), io: fake.io });
+
+		expect(code).toBe(0);
+		expect(existsSync(abHome)).toBe(false);
+	});
+
+	test("install replaces a symlinked extension path instead of writing through it", async () => {
+		const extensionsDir = join(home, ".omp", "agent", "extensions");
+		await mkdir(extensionsDir, { recursive: true });
+		const other = join(root, "other-checkout.js");
+		await writeFile(other, "other\n");
+		await chmod(other, 0o644);
+		await symlink(other, join(extensionsDir, "agentbridge.js"));
+
+		const fake = fakeIO((question) => question.includes("Cài extension OMP"));
+		const code = await runInstaller({ apply: true, uninstall: false, repoRoot: REPO_ROOT, env: installerEnv(), io: fake.io });
+
+		expect(code).toBe(0);
+		expect(await readFile(other, "utf8")).toBe("other\n");
+		expect((await stat(other)).mode & 0o777).toBe(0o644);
+		const installed = await lstat(join(extensionsDir, "agentbridge.js"));
+		expect(installed.isSymbolicLink()).toBe(false);
+		expect(installed.mode & 0o777).toBe(0o600);
+	});
+
+	test("stdin closing mid-plan stops with a non-zero exit instead of a silent success", async () => {
+		const fake = fakeIO();
+		let asked = 0;
+		fake.io.confirm = async () => {
+			asked += 1;
+			if (asked > 1) throw new StdinClosedError();
+			return false;
+		};
+		const code = await runInstaller({ apply: true, uninstall: false, repoRoot: REPO_ROOT, env: installerEnv(), io: fake.io });
+
+		expect(code).toBe(1);
+		expect(fake.output()).toContain("[dừng] stdin đã đóng");
+		expect(fake.output()).not.toContain("Hoàn tất.");
+		expect(asked).toBe(2);
+	});
+
+	test("re-running the installer replaces an existing MCP registration", async () => {
+		const fake = fakeIO((question) => question.includes("Đăng ký MCP"));
+		let adds = 0;
+		fake.io.run = async (argv) => {
+			fake.commands.push(argv);
+			if (argv[1] === "mcp" && argv[2] === "add") {
+				adds += 1;
+				if (adds === 1) return { exitCode: 1, stderr: "MCP server agentbridge already exists in user config" };
+			}
+			return { exitCode: 0, stderr: "" };
+		};
+		const code = await runInstaller({ apply: true, uninstall: false, repoRoot: REPO_ROOT, env: installerEnv(), io: fake.io });
+
+		expect(code).toBe(0);
+		expect(fake.commands.map((argv) => argv[2])).toEqual(["add", "remove", "add"]);
+		expect(fake.output()).toContain("đã thay đăng ký agentbridge cũ");
+	});
+
+	test("the extension path follows OMP's agent-directory rules", () => {
+		const extension = (extra: Record<string, string>) =>
+			resolveInstallPaths({ ...installerEnv(), ...extra }, REPO_ROOT).extensionFile;
+		const agentDir = join(root, "custom-agent");
+		expect(extension({ PI_CODING_AGENT_DIR: agentDir })).toBe(join(agentDir, "extensions", "agentbridge.js"));
+		// OMP joins PI_CONFIG_DIR onto the home directory.
+		expect(extension({ PI_CONFIG_DIR: ".omp-dev" })).toBe(join(home, ".omp-dev", "agent", "extensions", "agentbridge.js"));
+		// A profile wins and ignores PI_CODING_AGENT_DIR.
+		expect(extension({ OMP_PROFILE: "work", PI_CODING_AGENT_DIR: agentDir })).toBe(
+			join(home, ".omp", "profiles", "work", "agent", "extensions", "agentbridge.js"),
+		);
+		expect(extension({ PI_PROFILE: "lab", PI_CONFIG_DIR: ".omp-dev" })).toBe(
+			join(home, ".omp-dev", "profiles", "lab", "agent", "extensions", "agentbridge.js"),
+		);
 	});
 });

@@ -9,9 +9,9 @@
  * dev artifacts, then keeps config/audit/home unless the user explicitly agrees
  * to delete them. Never edits shell profiles.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, copyFile, mkdir, open, readFile, rm } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, rmdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -42,6 +42,21 @@ function homeDirectory(env: Env): string {
  return nonEmpty(fromEnv) ?? homedir();
 }
 
+/**
+ * OMP's active agent directory, resolved the way OMP 18.14 does: the config
+ * root is `path.join(homedir, PI_CONFIG_DIR || ".omp")` (always below home); a
+ * profile (`OMP_PROFILE` / `PI_PROFILE`) selects `<root>/profiles/<name>/agent`
+ * and then ignores `PI_CODING_AGENT_DIR`; otherwise `PI_CODING_AGENT_DIR`
+ * overrides `<root>/agent`. `omp --profile` on the command line is not visible here.
+ */
+export function ompAgentDir(env: Env, home: string): string {
+ const root = join(home, nonEmpty(env.PI_CONFIG_DIR) ?? ".omp");
+ const profile = nonEmpty(env.OMP_PROFILE) ?? nonEmpty(env.PI_PROFILE);
+ if (profile !== undefined) return join(root, "profiles", profile, "agent");
+ const agentDir = nonEmpty(env.PI_CODING_AGENT_DIR);
+ return agentDir !== undefined ? resolve(agentDir) : join(root, "agent");
+}
+
 /** Same defaults as @agentbridge/core `resolveDirs`, duplicated to keep this script standalone. */
 export function resolveInstallPaths(env: Env = process.env, repoRoot = resolve(import.meta.dir, "..")): InstallPaths {
  const home = homeDirectory(env);
@@ -55,7 +70,7 @@ export function resolveInstallPaths(env: Env = process.env, repoRoot = resolve(i
   mcpEntry: join(repoRoot, "plugins", "claude", "dist", "mcp-server.js"),
   home,
   agentbridgeHome,
-  extensionFile: join(home, ".omp", "agent", "extensions", "agentbridge.js"),
+  extensionFile: join(ompAgentDir(env, home), "extensions", "agentbridge.js"),
   configFile,
   stateDir,
   runtimeDir,
@@ -178,8 +193,11 @@ export interface CommandResult {
 export interface InstallerIO {
  out(text: string): void;
  err(text: string): void;
+ /** Throws `StdinClosedError` when no answer can arrive any more. */
  confirm(question: string, defaultYes: boolean): Promise<boolean>;
  run(argv: string[]): Promise<CommandResult>;
+ /** Releases stdin so the process can exit. */
+ close?(): void;
 }
 
 async function defaultRun(argv: string[]): Promise<CommandResult> {
@@ -188,19 +206,64 @@ async function defaultRun(argv: string[]): Promise<CommandResult> {
  return { exitCode, stderr };
 }
 
-async function defaultConfirm(question: string, defaultYes: boolean): Promise<boolean> {
- const rl = createInterface({ input: process.stdin, output: process.stderr });
- try {
-  const suffix = defaultYes ? "[Y/n]" : "[y/N]";
-  const answer = (await rl.question(`${question} ${suffix} `)).trim().toLowerCase();
-  if (answer === "") return defaultYes;
-  return answer === "y" || answer === "yes" || answer === "c" || answer === "có";
- } finally {
-  rl.close();
+/** stdin ended before an answer: the remaining steps must not run silently. */
+export class StdinClosedError extends Error {
+ constructor() {
+  super("stdin đã đóng trước khi có câu trả lời");
+  this.name = "StdinClosedError";
  }
 }
 
+/**
+ * One readline for the whole run: piped answers are consumed one per question
+ * (a readline per question swallowed the rest), and EOF rejects instead of
+ * leaving the question pending forever.
+ */
+function createStdinAsker(): Pick<InstallerIO, "confirm" | "close"> {
+ let rl: ReturnType<typeof createInterface> | undefined;
+ const lines: string[] = [];
+ let closed = false;
+ let waiting: ((line: string | undefined) => void) | undefined;
+ const reader = (): ReturnType<typeof createInterface> => {
+  if (rl !== undefined) return rl;
+  // terminal: false keeps the TTY in cooked mode: echo and Ctrl-C (SIGINT) still
+  // work while the interface stays open across steps.
+  rl = createInterface({ input: process.stdin, output: process.stderr, terminal: false });
+  rl.on("line", (line) => {
+   const resolveLine = waiting;
+   waiting = undefined;
+   if (resolveLine !== undefined) resolveLine(line);
+   else lines.push(line);
+  });
+  rl.on("close", () => {
+   closed = true;
+   const resolveLine = waiting;
+   waiting = undefined;
+   resolveLine?.(undefined);
+  });
+  return rl;
+ };
+ return {
+  async confirm(question, defaultYes) {
+   reader();
+   const suffix = defaultYes ? "[Y/n]" : "[y/N]";
+   process.stderr.write(`${question} ${suffix} `);
+   const buffered = lines.shift();
+   const line =
+    buffered ?? (closed ? undefined : await new Promise<string | undefined>((resolveLine) => { waiting = resolveLine; }));
+   if (line === undefined) throw new StdinClosedError();
+   const answer = line.trim().toLowerCase();
+   if (answer === "") return defaultYes;
+   return answer === "y" || answer === "yes" || answer === "c" || answer === "có";
+  },
+  close() {
+   rl?.close();
+  },
+ };
+}
+
 function defaultIO(): InstallerIO {
+ const asker = createStdinAsker();
  return {
   out: (text) => {
    process.stdout.write(text);
@@ -208,7 +271,8 @@ function defaultIO(): InstallerIO {
   err: (text) => {
    process.stderr.write(text);
   },
-  confirm: defaultConfirm,
+  confirm: asker.confirm,
+  close: asker.close,
   run: defaultRun,
  };
 }
@@ -230,24 +294,105 @@ function writeLine(io: InstallerIO, text: string): void {
  io.out(text.endsWith("\n") ? text : `${text}\n`);
 }
 
-async function createSampleConfig(file: string): Promise<StepResult> {
- await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+/** Write `data` to `<file>.<uuid>.tmp` (0600) and fsync it; the caller links or renames it into place. */
+async function writeTemp(file: string, data: string | Uint8Array): Promise<string> {
+ const tmp = `${file}.${randomUUID()}.tmp`;
+ const handle = await open(tmp, "wx", 0o600);
+ try {
+  await handle.writeFile(data);
+  await handle.sync();
+ } catch (error) {
+  await handle.close();
+  await rm(tmp, { force: true });
+  throw error;
+ }
+ await handle.close();
+ return tmp;
+}
+
+/**
+ * Replace `file` atomically (tmp → rename). `rename` replaces a symlink at
+ * `file` instead of writing through it, and an interrupted copy never leaves
+ * a truncated extension behind.
+ */
+async function replaceFileAtomic(file: string, data: string | Uint8Array): Promise<void> {
+ const tmp = await writeTemp(file, data);
+ try {
+  await rename(tmp, file);
+ } catch (error) {
+  await rm(tmp, { force: true });
+  throw error;
+ }
+}
+
+/** `false` when the file already exists; a failed write never leaves a partial file. */
+async function createExclusive(file: string, content: string): Promise<boolean> {
  let handle: Awaited<ReturnType<typeof open>>;
  try {
   handle = await open(file, "wx", 0o600);
  } catch (error) {
-  if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-   return { ok: true, note: "config đã tồn tại, không ghi đè" };
-  }
+  if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
   throw error;
  }
  try {
-  await handle.writeFile(`${JSON.stringify(SAMPLE_CONFIG, null, 2)}\n`);
+  await handle.writeFile(content);
   await handle.sync();
- } finally {
+ } catch (error) {
   await handle.close();
+  await rm(file, { force: true });
+  throw error;
  }
- return { ok: true };
+ await handle.close();
+ return true;
+}
+
+/** Existing parent: a real directory owned by this user (never a symlink). */
+async function assertOwnDirectory(dir: string): Promise<void> {
+ const info = await lstat(dir);
+ const uid = process.getuid?.();
+ if (info.isSymbolicLink() || !info.isDirectory() || (uid !== undefined && info.uid !== uid)) {
+  throw new Error(`thư mục không an toàn (cần thư mục thật thuộc user hiện tại): ${dir}`);
+ }
+}
+
+/**
+ * Spec §2: config 0600 in a 0700 parent, never overwriting an existing file.
+ * The content is written to a temp file and hard-linked into place, so a
+ * failed write never leaves a truncated config that later runs would keep.
+ */
+async function createSampleConfig(paths: InstallPaths): Promise<StepResult> {
+ const file = paths.configFile;
+ const parent = dirname(file);
+ await mkdir(parent, { recursive: true, mode: 0o700 });
+ await assertOwnDirectory(parent);
+ let note: string | undefined;
+ if (resolve(parent) === resolve(paths.agentbridgeHome) && ((await lstat(parent)).mode & 0o077) !== 0) {
+  // The host refuses a group/other-accessible AgentBridge home (01 §2), but a
+  // home that is (or contains) the user's HOME, the repo or a symlink is never re-moded.
+  const unsafe = await unsafeHomeReason(paths);
+  if (unsafe === undefined) {
+   await chmod(parent, 0o700);
+   note = `đã đặt quyền 0700 cho ${parent}`;
+  } else {
+   note = `không tự đổi quyền ${parent} (${unsafe}); host cần thư mục này ở quyền 0700`;
+  }
+ }
+ const content = `${JSON.stringify(SAMPLE_CONFIG, null, 2)}\n`;
+ const tmp = await writeTemp(file, content);
+ try {
+  await link(tmp, file);
+ } catch (error) {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "EEXIST") return { ok: true, note: "config đã tồn tại, không ghi đè" };
+  if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "ENOSYS" && code !== "EXDEV") {
+   throw error;
+  }
+  // Filesystem without hard links: exclusive create, removed again if the write fails.
+  if (!(await createExclusive(file, content))) return { ok: true, note: "config đã tồn tại, không ghi đè" };
+ } finally {
+  await rm(tmp, { force: true });
+ }
+ return note === undefined ? { ok: true } : { ok: true, note };
 }
 
 function installPlan(paths: InstallPaths, env: Env, io: InstallerIO): PlannedStep[] {
@@ -259,8 +404,7 @@ function installPlan(paths: InstallPaths, env: Env, io: InstallerIO): PlannedSte
    details: [`nguồn: ${paths.distFile}`, `đích:  ${paths.extensionFile}`, "dev mode: bundle từ plugins/omp/dist"],
    perform: async () => {
     await mkdir(dirname(paths.extensionFile), { recursive: true, mode: 0o700 });
-    await copyFile(paths.distFile, paths.extensionFile);
-    await chmod(paths.extensionFile, 0o600);
+    await replaceFileAtomic(paths.extensionFile, await readFile(paths.distFile));
     return { ok: true };
    },
   },
@@ -268,8 +412,17 @@ function installPlan(paths: InstallPaths, env: Env, io: InstallerIO): PlannedSte
    title: "Đăng ký MCP thủ công ở scope user (dev)",
    details: [displayCommand(addCommand), "dev mode: MCP single-file từ plugins/claude/dist"],
    perform: async () => {
-    const result = await io.run(addCommand);
-    if (result.exitCode === 0) return { ok: true };
+    let result = await io.run(addCommand);
+    let note: string | undefined;
+    if (result.exitCode !== 0 && /already exists/i.test(result.stderr)) {
+     // Re-running the installer (e.g. after moving the clone) replaces the old registration.
+     const removed = await io.run(mcpRemoveCommand(env));
+     if (removed.exitCode === 0) {
+      result = await io.run(addCommand);
+      note = "đã thay đăng ký agentbridge cũ";
+     }
+    }
+    if (result.exitCode === 0) return note === undefined ? { ok: true } : { ok: true, note };
     const detail = result.stderr.trim();
     return { ok: false, note: `claude mcp add lỗi (exit ${result.exitCode})${detail.length > 0 ? `: ${detail}` : ""}` };
    },
@@ -278,7 +431,7 @@ function installPlan(paths: InstallPaths, env: Env, io: InstallerIO): PlannedSte
    title: "Tạo config mẫu",
    details: [paths.configFile, "projects = [] (consult sẽ bị project_not_allowed cho tới khi thêm project)"],
    ...(configExists ? { skip: "config đã tồn tại, giữ nguyên" } : {}),
-   perform: () => createSampleConfig(paths.configFile),
+   perform: () => createSampleConfig(paths),
   },
  ];
 }
@@ -289,20 +442,132 @@ function isInside(base: string, target: string): boolean {
  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-/** Refuse recursive deletion of the OS home, filesystem root, repo, or the installed extension. */
-function unsafeHomeReason(paths: InstallPaths): string | undefined {
- if (paths.agentbridgeHome === paths.home) return "AGENTBRIDGE_HOME trùng thư mục home của user; không xóa";
- if (paths.agentbridgeHome === dirname(paths.agentbridgeHome)) return "AGENTBRIDGE_HOME là filesystem root; không xóa";
- if (paths.agentbridgeHome === paths.repoRoot || isInside(paths.agentbridgeHome, paths.repoRoot)) {
-  return "AGENTBRIDGE_HOME chứa repo; không xóa";
+async function realOrResolved(path: string): Promise<string> {
+ try {
+  return await realpath(path);
+ } catch {
+  return resolve(path);
  }
- if (isInside(paths.agentbridgeHome, paths.extensionFile)) {
-  return "AGENTBRIDGE_HOME chứa extension OMP; không xóa";
+}
+
+/**
+ * Refuse to clean the OS home, an ancestor of it, the filesystem root, the repo
+ * or the OMP extension dir — compared by real path, so a symlinked HOME or an
+ * AGENTBRIDGE_HOME alias cannot slip past — and anything that is not a real
+ * directory owned by this user. Deletion itself is limited to AgentBridge files.
+ */
+export async function unsafeHomeReason(paths: InstallPaths): Promise<string | undefined> {
+ const home = await realOrResolved(paths.agentbridgeHome);
+ const userHome = await realOrResolved(paths.home);
+ const repo = await realOrResolved(paths.repoRoot);
+ const extensionDir = await realOrResolved(dirname(paths.extensionFile));
+ if (home === dirname(home)) return "AGENTBRIDGE_HOME là filesystem root; không xóa";
+ if (isInside(home, userHome)) return "AGENTBRIDGE_HOME trùng thư mục home của user (hoặc chứa nó); không xóa";
+ if (isInside(home, repo)) return "AGENTBRIDGE_HOME chứa repo; không xóa";
+ if (isInside(home, extensionDir)) return "AGENTBRIDGE_HOME chứa extension OMP; không xóa";
+ let info: Awaited<ReturnType<typeof lstat>>;
+ try {
+  info = await lstat(paths.agentbridgeHome);
+ } catch {
+  return undefined;
+ }
+ const uid = process.getuid?.();
+ if (info.isSymbolicLink()) return "AGENTBRIDGE_HOME là symlink; không xóa";
+ if (!info.isDirectory() || (uid !== undefined && info.uid !== uid)) {
+  return "AGENTBRIDGE_HOME không phải thư mục thuộc user hiện tại; không xóa";
  }
  return undefined;
 }
 
-function uninstallPlan(paths: InstallPaths, env: Env, io: InstallerIO): PlannedStep[] {
+/** A directory entry AgentBridge created: regular file or socket, never a symlink. */
+async function removeOwnEntries(dir: string, matches: (name: string) => boolean): Promise<void> {
+ let names: string[];
+ try {
+  const info = await lstat(dir);
+  if (info.isSymbolicLink() || !info.isDirectory()) return;
+  names = await readdir(dir);
+ } catch {
+  return;
+ }
+ for (const name of names) {
+  if (!matches(name)) continue;
+  const path = join(dir, name);
+  try {
+   const info = await lstat(path);
+   if (info.isFile() || info.isSocket()) await rm(path, { force: true });
+  } catch {
+   // vanished meanwhile
+  }
+ }
+}
+
+async function removeDirIfEmpty(dir: string): Promise<void> {
+ try {
+  const info = await lstat(dir);
+  if (info.isSymbolicLink() || !info.isDirectory()) return;
+  await rmdir(dir);
+ } catch {
+  // not empty or already gone: keep it
+ }
+}
+
+const TMP_SUFFIX = /\.[0-9a-f-]{36}\.tmp$/;
+
+const AGENTBRIDGE_CONFIG_KEYS: ReadonlySet<string> = new Set(["version", "projects", "allowFrom", "consult", "chat", "audit", "ui"]);
+
+function isAgentBridgeConfig(raw: string): boolean {
+ try {
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  const record = parsed as Record<string, unknown>;
+  if (record.version !== undefined && record.version !== 1) return false;
+  // Every key must be an AgentBridge key: a foreign config.json that merely has
+  // a `projects` field is not ours to delete.
+  if (!Object.keys(record).every((key) => AGENTBRIDGE_CONFIG_KEYS.has(key))) return false;
+  return record.projects === undefined || Array.isArray(record.projects);
+ } catch {
+  return false;
+ }
+}
+
+/**
+ * Delete only what AgentBridge writes under its home — `config.json` (when it
+ * is an AgentBridge config), the audit log, registry records, tokens and
+ * sockets — then remove the emptied directories. Anything else keeps the home
+ * and is reported, so a mistaken AGENTBRIDGE_HOME can never lose foreign data.
+ */
+async function removeAgentBridgeHome(home: string): Promise<StepResult> {
+ const config = join(home, "config.json");
+ try {
+  const info = await lstat(config);
+  if (info.isFile() && isAgentBridgeConfig(await readFile(config, "utf8"))) await rm(config, { force: true });
+ } catch {
+  // no config
+ }
+ await removeOwnEntries(home, (name) => name.startsWith("config.json.") && TMP_SUFFIX.test(name));
+ const stateDir = join(home, "state");
+ await removeOwnEntries(stateDir, (name) => name === "audit.jsonl" || name === "audit.jsonl.1");
+ await removeDirIfEmpty(stateDir);
+ const runDir = join(home, "run");
+ const sessionsDir = join(runDir, "sessions");
+ await removeOwnEntries(sessionsDir, (name) => /^omp-.+\.(?:json|token)$/.test(name) || TMP_SUFFIX.test(name));
+ await removeDirIfEmpty(sessionsDir);
+ const socketsDir = join(runDir, "s");
+ await removeOwnEntries(socketsDir, (name) => /^[0-9a-f]{16}\.sock$/.test(name));
+ await removeDirIfEmpty(socketsDir);
+ await removeDirIfEmpty(runDir);
+ await removeDirIfEmpty(home);
+ if (!existsSync(home)) return { ok: true };
+ let left: string[] = [];
+ try {
+  left = await readdir(home);
+ } catch {
+  // unreadable: report the directory itself
+ }
+ return { ok: true, note: `giữ ${home} vì còn file không phải của AgentBridge: ${left.join(", ") || "(không đọc được)"}` };
+}
+
+async function uninstallPlan(paths: InstallPaths, env: Env, io: InstallerIO): Promise<PlannedStep[]> {
  const removeCommand = mcpRemoveCommand(env);
  const extensionExists = existsSync(paths.extensionFile);
  const configExists = existsSync(paths.configFile);
@@ -310,7 +575,7 @@ function uninstallPlan(paths: InstallPaths, env: Env, io: InstallerIO): PlannedS
  const configInsideHome = isInside(paths.agentbridgeHome, paths.configFile);
  const auditInsideHome = isInside(paths.agentbridgeHome, paths.auditFile);
  const homeExists = existsSync(paths.agentbridgeHome);
- const unsafeHome = unsafeHomeReason(paths);
+ const unsafeHome = await unsafeHomeReason(paths);
  const steps: PlannedStep[] = [
   {
    title: "Gỡ extension OMP (dev)",
@@ -370,15 +635,17 @@ function uninstallPlan(paths: InstallPaths, env: Env, io: InstallerIO): PlannedS
 
  steps.push({
   title: "Xóa thư mục AgentBridge home",
-  details: [paths.agentbridgeHome, "config, state và runtime mặc định nằm trong thư mục này"],
+  details: [
+   paths.agentbridgeHome,
+   "chỉ xóa config.json, audit log và file runtime của AgentBridge; còn file khác thì giữ thư mục",
+  ],
   optional: true,
   ...(homeExists ? {} : { skip: "không có thư mục home" }),
   ...(unsafeHome !== undefined ? { skip: unsafeHome } : {}),
   perform: async () => {
-   const reason = unsafeHomeReason(paths);
+   const reason = await unsafeHomeReason(paths);
    if (reason !== undefined) return { ok: false, note: reason };
-   await rm(paths.agentbridgeHome, { recursive: true, force: true });
-   return { ok: true };
+   return removeAgentBridgeHome(paths.agentbridgeHome);
   },
  });
  return steps;
@@ -393,9 +660,18 @@ export interface InstallerOptions {
 }
 
 export async function runInstaller(options: InstallerOptions): Promise<number> {
+ const io: InstallerIO = { ...defaultIO(), ...options.io };
+ try {
+  return await runInstallerWith(options, io);
+ } finally {
+  // An open readline keeps stdin, and therefore the process, alive.
+  io.close?.();
+ }
+}
+
+async function runInstallerWith(options: InstallerOptions, io: InstallerIO): Promise<number> {
  const env = options.env ?? process.env;
  const paths = resolveInstallPaths(env, options.repoRoot);
- const io: InstallerIO = { ...defaultIO(), ...options.io };
  const mode = options.uninstall ? "GỠ CÀI ĐẶT" : "CÀI ĐẶT";
  const header = options.apply ? `${mode} — APPLY` : `${mode} — DRY RUN`;
 
@@ -416,7 +692,7 @@ export async function runInstaller(options: InstallerOptions): Promise<number> {
   writeLine(io, "");
  }
 
- const steps = options.uninstall ? uninstallPlan(paths, env, io) : installPlan(paths, env, io);
+ const steps = options.uninstall ? await uninstallPlan(paths, env, io) : installPlan(paths, env, io);
  let failed = false;
 
  for (const [index, step] of steps.entries()) {
@@ -438,7 +714,15 @@ export async function runInstaller(options: InstallerOptions): Promise<number> {
   }
 
   const question = step.optional === true ? `Xóa?` : `Thực hiện?`;
-  const approved = await io.confirm(`${question} ${step.title}`, step.optional !== true);
+  let approved: boolean;
+  try {
+   approved = await io.confirm(`${question} ${step.title}`, step.optional !== true);
+  } catch (error) {
+   if (!(error instanceof StdinClosedError)) throw error;
+   failed = true;
+   writeLine(io, "  [dừng] stdin đã đóng: không nhận được câu trả lời; các bước còn lại không chạy.");
+   break;
+  }
   if (!approved) {
    writeLine(io, step.optional === true ? "  [giữ nguyên]" : "  [bỏ qua]");
    writeLine(io, "");

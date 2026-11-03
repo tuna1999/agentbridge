@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { builtinModules } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
 
@@ -43,13 +43,36 @@ export interface ManifestFile {
  readonly content: string;
 }
 
-const BUILTINS = new Set(builtinModules.map((name) => name.replace(/^node:/, "")));
+/**
+ * Bare names Bun prints for `node:` imports. Prefix-only modules (`node:sqlite`)
+ * are listed with their prefix and stay prefix-only; `undici`/`ws` are Bun
+ * extras, not Node built-ins, so they are not allowed bare.
+ */
+const BUN_ONLY_PACKAGES = new Set(["undici", "ws"]);
+const BUILTINS = new Set(builtinModules.filter((name) => !name.startsWith("node:") && !BUN_ONLY_PACKAGES.has(name)));
 
 /** Absolute paths that only make sense on the machine that produced the bundle. */
 const GENERIC_MACHINE_PATHS = [
- /(?:^|[\s"'`(=,\[])(\/(?:home|Users)\/[A-Za-z0-9._-]+(?:\/[^\s"'`)]*)?)/gm,
- /(?:^|[\s"'`(=,\[])(\/root(?:\/[^\s"'`)]*)?)/gm,
+ /(?:^|[\s"'`(=,\[:])(\/(?:home|Users|var\/home)\/[A-Za-z0-9._-]+(?:\/[^\s"'`)]*)?)/gm,
+ /(?:^|[\s"'`(=,\[:])(\/root(?=$|[\/\s"'`)])(?:\/[^\s"'`)]*)?)/gm,
  /(?:^|[\s"'`(=,\[])([A-Za-z]:(?:\\\\|\\)[^\s"'`)]*)/gm,
+ // file:// URLs and JSON-escaped slashes hide the usual separators.
+ /file:\/\/(\/(?:home|Users|root|var\/home)\b[^\s"'`)]*)/g,
+ /(\\\/(?:home|Users)\\\/[A-Za-z0-9._-]+)/g,
+];
+
+/**
+ * Module loading that `scanImports` cannot see: non-literal specifiers and
+ * runtime `require` helpers. Any of these could load a non-builtin at runtime.
+ */
+const DYNAMIC_LOADERS: ReadonlyArray<{ label: string; pattern: RegExp }> = [
+ { label: "non-literal import()", pattern: /\bimport\s*\(\s*(?!["'`])/g },
+ { label: "non-literal require()", pattern: /(?<![.\w$])require\s*\(\s*(?!["'`])/g },
+ { label: "__require()", pattern: /\b__require\s*\(/g },
+ { label: "import.meta.require", pattern: /\bimport\.meta\.require\b/g },
+ { label: "createRequire()", pattern: /\bcreateRequire\s*\(/g },
+ { label: "module.require()", pattern: /\bmodule\.require\s*\(/g },
+ { label: "require.resolve()", pattern: /\brequire\.resolve\s*\(/g },
 ];
 
 export interface ImportUse {
@@ -61,6 +84,8 @@ export interface BundleAudit {
  bytes: number;
  imports: ImportUse[];
  external: ImportUse[];
+ /** Loader calls the import scan cannot resolve; the specifier holds the label. */
+ dynamic: ImportUse[];
  machinePaths: string[];
 }
 
@@ -227,6 +252,45 @@ export function generatedManifests(root: string, version: string): ManifestFile[
  ];
 }
 
+/** Workspace packages whose `version` the bundles embed (MCP serverInfo, extensionVersion). */
+export const WORKSPACE_PACKAGES = ["protocol", "core", "omp-extension", "mcp-server"] as const;
+
+function workspaceManifest(root: string, name: string): string {
+ return join(root, "packages", name, "package.json");
+}
+
+/** Replace only the top-level `"version"` value, keeping the file's own formatting. */
+export function withVersion(raw: string, version: string): string {
+ return raw.replace(/^(\s*"version"\s*:\s*")[^"]*(")/m, `$1${version}$2`);
+}
+
+/** Root version → every workspace package.json, before the bundles are built from them. */
+async function syncWorkspaceVersions(root: string, version: string): Promise<void> {
+ for (const name of WORKSPACE_PACKAGES) {
+  const path = workspaceManifest(root, name);
+  const raw = await readFile(path, "utf8");
+  const next = withVersion(raw, version);
+  if (next !== raw) {
+   await writeFile(path, next);
+   console.log(`[version] ${path} -> ${version}`);
+  }
+ }
+}
+
+async function checkWorkspaceVersions(root: string, version: string): Promise<boolean> {
+ let ok = true;
+ for (const name of WORKSPACE_PACKAGES) {
+  const path = workspaceManifest(root, name);
+  const raw = await readFile(path, "utf8");
+  if (withVersion(raw, version) !== raw) {
+   console.error(`[check] workspace version mismatch: ${path} (root is ${version})`);
+   console.error("[check] run `bun run build` to propagate the root version");
+   ok = false;
+  }
+ }
+ return ok;
+}
+
 function lineAt(source: string, index: number): number {
  let line = 1;
  for (let cursor = 0; cursor < index; cursor += 1) {
@@ -280,12 +344,21 @@ export function collectMachinePaths(
   for (const match of source.matchAll(pattern)) {
    const value = match[1];
    if (value === undefined) continue;
-   // `/tmp` is shared and not evidence of the build machine; skip only if it is the whole match.
-   if (value === tmpdir()) continue;
    found.add(value);
   }
  }
  return [...found].sort();
+}
+
+export function collectDynamicLoads(source: string): ImportUse[] {
+ const uses: ImportUse[] = [];
+ for (const { label, pattern } of DYNAMIC_LOADERS) {
+  pattern.lastIndex = 0;
+  for (const match of source.matchAll(pattern)) {
+   uses.push({ specifier: label, line: lineAt(source, match.index ?? 0) });
+  }
+ }
+ return uses.sort((left, right) => left.line - right.line);
 }
 
 export function auditBundle(source: string, roots?: readonly string[]): BundleAudit {
@@ -294,6 +367,7 @@ export function auditBundle(source: string, roots?: readonly string[]): BundleAu
   bytes: Buffer.byteLength(source, "utf8"),
   imports,
   external: imports.filter((use) => !isBuiltinSpecifier(use.specifier)),
+  dynamic: collectDynamicLoads(source),
   machinePaths: collectMachinePaths(source, roots),
  };
 }
@@ -345,6 +419,11 @@ function reportAudit(label: string, audit: BundleAudit): boolean {
   for (const use of audit.external) console.error(`  - ${use.specifier} (line ${use.line})`);
  } else {
   console.log(`[deps] ${label}: OK (node:*/bun built-ins only)`);
+ }
+ if (audit.dynamic.length > 0) {
+  ok = false;
+  console.error(`[deps] ${label}: ERROR: dynamic module loading:`);
+  for (const use of audit.dynamic) console.error(`  - ${use.specifier} (line ${use.line})`);
  }
  if (audit.machinePaths.length > 0) {
   ok = false;
@@ -420,7 +499,12 @@ async function checkManifests(root: string, version: string): Promise<boolean> {
  return ok;
 }
 
-async function checkBundles(): Promise<boolean> {
+/** Where a committed bundle lives below `outputsRoot` (the repo, or a copy of its outputs). */
+function committedPath(target: BundleTarget, outputsRoot: string): string {
+ return join(outputsRoot, relative(REPO_ROOT, target.committed));
+}
+
+async function checkBundles(outputsRoot: string): Promise<boolean> {
  const temp = await mkdtemp(join(tmpdir(), "agentbridge-build-check-"));
  try {
   let ok = true;
@@ -429,25 +513,26 @@ async function checkBundles(): Promise<boolean> {
    await runBundle(target, rebuilt);
    if (!(await auditFile(`${target.name} (check)`, rebuilt))) ok = false;
 
+   const committed = committedPath(target, outputsRoot);
    const [rebuiltBytes, committedBytes] = await Promise.all([
     readFile(rebuilt),
-    readFile(target.committed).catch(() => null),
+    readFile(committed).catch(() => null),
    ]);
    if (committedBytes === null) {
-    console.error(`[check] committed bundle missing: ${target.committed}`);
+    console.error(`[check] committed bundle missing: ${committed}`);
     ok = false;
     continue;
    }
    const rebuiltHash = sha256(rebuiltBytes);
    const committedHash = sha256(committedBytes);
    if (rebuiltHash !== committedHash) {
-    console.error(`[check] bundle mismatch: ${target.committed}`);
+    console.error(`[check] bundle mismatch: ${committed}`);
     console.error(`[check] committed sha256 ${committedHash}`);
     console.error(`[check] rebuilt   sha256 ${rebuiltHash}`);
     console.error("[check] run `bun run build` and commit the new bundle");
     ok = false;
    } else {
-    console.log(`[check] bundle OK: ${target.committed} sha256=${rebuiltHash}`);
+    console.log(`[check] bundle OK: ${committed} sha256=${rebuiltHash}`);
    }
   }
   return ok;
@@ -459,24 +544,33 @@ async function checkBundles(): Promise<boolean> {
 export interface CliOptions {
  check: boolean;
  help: boolean;
+ /** `--check` only: compare against outputs copied below this directory instead of the repo. */
+ outputs?: string;
 }
 
 export function parseArgs(argv: readonly string[]): CliOptions {
  let check = false;
  let help = false;
- for (const arg of argv) {
+ let outputs: string | undefined;
+ for (let index = 0; index < argv.length; index += 1) {
+  const arg = argv[index] ?? "";
   if (arg === "--check") {
    check = true;
   } else if (arg === "--help" || arg === "-h") {
    help = true;
+  } else if (arg === "--outputs" || arg.startsWith("--outputs=")) {
+   const value = arg === "--outputs" ? argv[++index] : arg.slice("--outputs=".length);
+   if (value === undefined || value.length === 0) throw new Error("--outputs needs a directory");
+   outputs = resolve(value);
   } else {
    throw new Error(`unknown argument: ${arg}`);
   }
  }
- return { check, help };
+ if (outputs !== undefined && !check) throw new Error("--outputs only works with --check");
+ return outputs === undefined ? { check, help } : { check, help, outputs };
 }
 
-const USAGE = `Usage: bun scripts/build.ts [--check]\n\n  (no flags)  build both bundles and regenerate plugin manifests\n  --check     rebuild into a temp dir and verify committed bundles/manifests\n`;
+const USAGE = `Usage: bun scripts/build.ts [--check [--outputs DIR]]\n\n  (no flags)  propagate the root version, build both bundles and regenerate plugin manifests\n  --check     rebuild into a temp dir and verify committed bundles/manifests/versions\n  --outputs   (with --check) compare against a copy of the outputs below DIR\n`;
 
 async function main(argv: readonly string[]): Promise<number> {
  const options = parseArgs(argv);
@@ -489,9 +583,11 @@ async function main(argv: readonly string[]): Promise<number> {
  console.log(`[build] version ${version} (root package.json)`);
 
  if (options.check) {
-  const manifestsOk = await checkManifests(REPO_ROOT, version);
-  const bundlesOk = await checkBundles();
-  if (!manifestsOk || !bundlesOk) {
+  const outputsRoot = options.outputs ?? REPO_ROOT;
+  const versionsOk = await checkWorkspaceVersions(REPO_ROOT, version);
+  const manifestsOk = await checkManifests(outputsRoot, version);
+  const bundlesOk = await checkBundles(outputsRoot);
+  if (!versionsOk || !manifestsOk || !bundlesOk) {
    console.error("[check] FAILED");
    return 1;
   }
@@ -499,6 +595,8 @@ async function main(argv: readonly string[]): Promise<number> {
   return 0;
  }
 
+ // The bundles embed the workspace package versions: sync them first.
+ await syncWorkspaceVersions(REPO_ROOT, version);
  const temp = await mkdtemp(join(tmpdir(), "agentbridge-build-"));
  try {
   if (!(await buildAll(temp))) {
