@@ -38,7 +38,7 @@ Protocol shape: `Envelope` with `v:1`, `hop:0`, closed `MsgType` (`hello|status|
 
 | Path | Purpose |
 |---|---|
-| `packages/protocol/src/` | Wire contract: envelopes, validation, framing, error taxonomy, target matching, redaction, path guard, limits, Vietnamese user strings |
+| `packages/protocol/src/` | Wire contract: envelopes, validation, framing, error taxonomy, target matching, redaction, text sanitizer (`sanitizeText`: what an operator approves is exactly what a model receives), path guard, limits, Vietnamese user strings |
 | `packages/core/src/` | Host/client runtime: dirs + secure fs, config, registry + liveness + stale sweep, IPC server/client, audit, git/proc introspection |
 | `packages/omp-extension/src/` | OMP extension: `lifecycle.ts` (Host), `consult.ts`, `chat.ts`, `autochat.ts`, `project-config.ts`, `omp.ts` API adapter |
 | `packages/mcp-server/src/` | stdio MCP server, MCP tools, `ab` CLI (`cli.ts`), caller-support startup gate, formatters |

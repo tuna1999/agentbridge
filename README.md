@@ -144,6 +144,8 @@ Muốn dùng, phải thêm **đường dẫn thật** (`realpath`) của từng 
 "projects": ["/home/you/projects/my-app", "/home/you/projects/other-app"]
 ```
 
+Entry phải là **đường dẫn tuyệt đối**. Entry tương đối (`"."`, `"my-app"`, `"~/x"`) bị bỏ qua kèm cảnh báo: trước đây chúng được resolve theo thư mục mà tiến trình OMP được mở, nên `"."` vô tình cho phép mọi project. `/agentbridge disallow` so khớp theo realpath, nên gỡ được cả entry viết khác (dấu `/` cuối, symlink tới project).
+
 Lý do có allowlist: extension cài ở scope user được nạp vào **mọi** phiên OMP, nên không có danh sách này thì bất kỳ phiên Claude nào cũng có thể hỏi (hoặc, với chat, khiến OMP chạy tool trong) một repo nhạy cảm đang mở OMP.
 
 Config được đọc lại ở mỗi request (cache theo mtime), không cần khởi động lại OMP. Ngoại lệ: `chat.autoApprove` chỉ được snapshot ở `session_start` của phiên main TUI; xem mục Autochat.
@@ -220,6 +222,12 @@ Nếu OMP mở **không** có `-e`, hoặc Claude mở **không** có `--mcp-con
 
 Claude sẽ gọi `agent_list` (nếu cần) rồi `agent_consult` hoặc `agent_chat`. Với consult, lần đầu OMP hiện hộp xác nhận: cho phép một lần, cho phép trong phiên, hoặc từ chối. Từ chối thì Claude nhận `denied` và không được tự thử lại. Với chat, OMP hỏi Gửi/Từ chối cho từng tin, **trừ khi** người dùng đã bật autochat; `/agentbridge trust` của consult không bỏ qua bước này.
 
+Hộp xác nhận consult hiện câu hỏi (tối đa 8 dòng / 300 ký tự), dòng `Kích thước: N dòng · M ký tự`, số và đường dẫn các file đính kèm, cùng session của caller. Nếu phần xem trước bị cắt, dòng kích thước ghi thêm `(đã ẩn K ký tự)` và hộp đầu tiên chỉ có **Xem toàn văn/Từ chối**: các nút cho phép chỉ xuất hiện ở trang cuối, sau khi đã hiện hết câu hỏi (giống chat). `consult.consentTimeoutMs` là hạn chót chung cho mọi trang. Mỗi trang khoảng 1 000 ký tự / 14 dòng: câu hỏi 3 000 ký tự cần khoảng 5 hộp thoại, 8 000 ký tự khoảng 10, nên với mặc định 60 giây câu hỏi rất dài khó duyệt kịp. Code nên đi qua `include_files` (hộp xác nhận chỉ liệt kê đường dẫn); nếu thường xuyên hỏi dài, tăng `consult.consentTimeoutMs`.
+
+Hết thời gian chờ **không bao giờ** được tính là đồng ý. Selector của OMP tự chọn mục đang được trỏ khi đếm ngược hết, nên AgentBridge trỏ sẵn vào **Từ chối** (Enter theo phản xạ cũng là từ chối) và coi lựa chọn đến sau hạn chót là hết giờ. Điều này áp dụng cho consult, chat và `/agentbridge allow|disallow`.
+
+Văn bản hiển thị trong hộp xác nhận và văn bản gửi tới OMP là **cùng một chuỗi**: trước khi hiện và gửi, host bỏ escape terminal, ký tự điều khiển và ký tự vô hình (zero-width, bidi, tag Unicode U+E0000–E007F, variation selector…) mà terminal không vẽ nhưng model vẫn đọc được. Câu trả lời trả về Claude cũng được làm sạch như vậy.
+
 AgentBridge chỉ trả kết quả tool bằng `content[].text`; **không** gửi `structuredContent` và không khai báo `outputSchema`. Claude Code 2.1.x ưu tiên `structuredContent` khi có, nên JSON trước đây đã che mất phần text chứa `<<<OMP_REPLY` và dòng cảnh báo "DỮ LIỆU THAM KHẢO". Text là contract duy nhất: `agent_list` in sessionId đầy đủ, model, status, worktree, branch, liveness và consent; `agent_status` in đầy đủ các trường; mọi lỗi bắt đầu bằng `[AgentBridge] <code>`. Với consult, header ghi thêm "đã cắt theo replyMaxBytes" khi `truncated=true`; `capped` không được đưa ra output để tránh hiểu nhầm là reply bị cắt.
 
 Trong chế độ consult:
@@ -248,7 +256,7 @@ Sau khi bật và mở lại OMP (hoặc chờ heartbeat cập nhật record), C
   - `chat.consentTimeoutMs` là hạn chót chung cho toàn bộ quá trình xem (snippet + mọi trang), không reset theo từng trang. Consent của consult (kể cả `always` hoặc `/agentbridge trust`) **không** áp dụng cho chat. Nếu autochat đang bật và tin nằm trong giới hạn, bước này được bỏ qua; xem mục Autochat.
 - Nếu OMP đang bận: mặc định trả `busy`; đặt `queueWhenBusy: true` để gửi nối tiếp bằng `followUp` (không bao giờ `steer`).
 - Chỉ một chat chờ trả lời tại một thời điểm; chat thứ hai nhận `busy`.
-- Kết quả trả Claude vẫn là text, có header, dòng **DỮ LIỆU THAM KHẢO** và khung `<<<OMP_REPLY … OMP_REPLY>>>`.
+- Kết quả trả Claude vẫn là text, có header, dòng **DỮ LIỆU THAM KHẢO** và khung `<<<OMP_REPLY … OMP_REPLY>>>`. Nếu chính câu trả lời có chứa chuỗi `OMP_REPLY`, khung dùng nhãn đánh số mà câu trả lời không chứa (ví dụ `OMP_REPLY_1`) và có một dòng nói rõ nhãn nào kết thúc khung, nên câu trả lời không thể tự "đóng khung" sớm. Tên phiên trong header được đặt trong ngoặc kép kiểu JSON, luôn trên một dòng.
 - Timeout (`timeout_s`, 10–1800 giây) bao gồm cả thời gian xác nhận và chờ trả lời. Timeout trả `target_exited` với `details.reason="chat_timeout"`; MCP hiển thị: *"OMP có thể vẫn đang chạy lượt này trong phiên; KHÔNG gửi lại tin, hãy hỏi người dùng hoặc dùng agent_status."* Session switch/shutdown hoặc người dùng abort trả `cancelled`.
 
 Tin chat dùng chung trần `consult.maxQuestionBytes` (mặc định 32 KiB); vượt thì trả `too_large`.
@@ -348,7 +356,7 @@ CLI dùng cùng code client với MCP server, hữu ích để tự kiểm tra m
 
 ```bash
 bun packages/mcp-server/src/cli.ts list [--scope worktree|repo|all] [--json]
-bun packages/mcp-server/src/cli.ts status [target]
+bun packages/mcp-server/src/cli.ts status [target | --target X]
 bun packages/mcp-server/src/cli.ts consult "<câu hỏi>" [--target X] [--file path[:start-end]]... [--no-stream]
 bun packages/mcp-server/src/cli.ts chat "<tin nhắn>" [--target X]
 bun packages/mcp-server/src/cli.ts doctor
@@ -357,9 +365,11 @@ bun packages/mcp-server/src/cli.ts sweep
 
 `ab sweep` dọn bản ghi registry/socket của phiên OMP đã chết (pid không còn hoặc khác thời điểm start, cùng uid). Extension cũng tự sweep sau mỗi lần publish record, nên thường không cần chạy tay. Socket mồ côi không có record thì không bị dọn.
 
+Cờ nhận cả dạng `--cờ=giá-trị`; `--` kết thúc phần cờ (để gửi nội dung bắt đầu bằng `-`); `-h`/`--help` ở bất kỳ vị trí nào in hướng dẫn. Mỗi lệnh chỉ nhận cờ của nó: cờ thừa (ví dụ `ab chat … --file x`) là lỗi dùng sai, thoát mã 2, thay vì bị bỏ qua âm thầm. Ở chế độ stream mặc định, `ab consult` in phần stream rồi in nốt phần còn thiếu của câu trả lời cuối (host không stream dòng cuối chưa có xuống dòng); escape terminal trong output của model bị loại bỏ.
+
 `ab consult` tự định danh là `claude-code` với session `cli-<pid>`. Host OMP vẫn áp đầy đủ consent, rate limit và allowlist project; CLI không bỏ qua bước xác nhận. `ab chat` cũng vậy: tin đi vào transcript OMP và cần xác nhận từng lần, trừ khi autochat đang bật.
 
-`ab doctor` in ra ba đường dẫn đang dùng (config file, state dir, runtime dir), rồi kiểm tra: phiên bản Bun, `claude`, `omp`, quyền thư mục runtime/sessions, config, extension đã cài, MCP đã đăng ký (user/local/project). Nó cũng phát hiện **Claude plugin** (MCP server do plugin cung cấp) và **OMP plugin** (extension cài qua `omp plugin`), cảnh báo **trùng cách cài** (dev extension + OMP plugin, manual MCP + Claude plugin), `.omp/extensions/*agentbridge*` ở cấp project, và thư mục legacy XDG (`~/.config/agentbridge`, `~/.local/state/agentbridge`, `$XDG_RUNTIME_DIR/agentbridge`) — các thư mục legacy không còn được dùng và không được tự di chuyển.
+`ab doctor` in ra ba đường dẫn đang dùng (config file, state dir, runtime dir), rồi kiểm tra: phiên bản Bun (≥ 1.4), `claude`, `omp`, quyền các thư mục mà host bắt buộc (home, runtime, sessions, socket, state: 0700, đúng chủ, không symlink), config (đọc chặt theo schema: sai schema là `[fail]`, không báo `[ok]` với mặc định an toàn; cảnh báo entry `projects` tương đối/không tồn tại và file config không phải 0600), extension đã cài, MCP đã đăng ký (user/local/project). `ab doctor` không bao giờ gọi `claude` (chỉ đọc `~/.claude/plugins/installed_plugins.json`). Nó cũng phát hiện **Claude plugin** (MCP server do plugin cung cấp) và **OMP plugin** (extension cài qua `omp plugin`), cảnh báo **trùng cách cài** (dev extension + OMP plugin, manual MCP + Claude plugin), `.omp/extensions/*agentbridge*` ở cấp project, và thư mục legacy XDG (`~/.config/agentbridge`, `~/.local/state/agentbridge`, `$XDG_RUNTIME_DIR/agentbridge`) — các thư mục legacy không còn được dùng và không được tự di chuyển.
 
 ---
 
@@ -444,9 +454,9 @@ Script sẽ:
 1. xóa `~/.omp/agent/extensions/agentbridge.js`;
 2. chạy `claude mcp remove -s user agentbridge`;
 3. **giữ nguyên** config và audit log, trừ khi bạn đồng ý xóa ở bước tùy chọn tương ứng (mặc định là giữ). Khi config/audit nằm trong `~/.agentbridge` (mặc định), bước xóa thư mục home thay thế các bước riêng lẻ này để tránh xóa trùng;
-4. hỏi trước khi xóa `~/.agentbridge` (bước tùy chọn, mặc định **giữ**). Đồng ý thì toàn bộ config, state và runtime trong thư mục đó bị xóa; từ chối thì dữ liệu vẫn còn. Nếu `AGENTBRIDGE_HOME` trỏ tới thư mục khác, script hỏi xóa đúng thư mục đó.
+4. hỏi trước khi dọn `~/.agentbridge` (bước tùy chọn, mặc định **giữ**). Đồng ý thì chỉ các file AgentBridge tự tạo bị xóa (`config.json`, audit log, bản ghi registry, token, socket) rồi các thư mục rỗng được gỡ; nếu còn file khác, thư mục được giữ lại và script liệt kê các file đó. Nếu `AGENTBRIDGE_HOME` trỏ tới thư mục khác, script dọn đúng thư mục đó theo cùng quy tắc. Script từ chối khi `AGENTBRIDGE_HOME` (so theo realpath) trùng hoặc chứa thư mục home của user, là filesystem root, chứa repo hay extension OMP, là symlink, hoặc không thuộc user hiện tại.
 
-Dry-run (`bun scripts/install.ts --uninstall`) hiển thị bước xóa home là tùy chọn, không đụng tới file nào. Script không xóa extension, đăng ký MCP hay dữ liệu nào khi bạn chưa xác nhận.
+Dry-run (`bun scripts/install.ts --uninstall`) hiển thị bước xóa home là tùy chọn, không đụng tới file nào. Script không xóa extension, đăng ký MCP hay dữ liệu nào khi bạn chưa xác nhận. Nếu stdin đóng giữa chừng (ví dụ chạy với `</dev/null` hoặc pipe thiếu câu trả lời), script dừng ở bước đó và thoát mã 1 thay vì báo "Hoàn tất". Đường dẫn extension theo thư mục agent của OMP: `~/<PI_CONFIG_DIR hoặc .omp>/agent` (giống OMP, `PI_CONFIG_DIR` luôn tính từ home), `~/<…>/profiles/<tên>/agent` khi đặt `OMP_PROFILE`/`PI_PROFILE`, hoặc `PI_CODING_AGENT_DIR` khi không dùng profile. Profile chọn bằng `omp --profile` trên dòng lệnh thì phải tự chép.
 
 Lệnh thủ công tương đương:
 
