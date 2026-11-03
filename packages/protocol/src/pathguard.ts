@@ -77,15 +77,20 @@ export function resolveInside(root: string, p: string, options: ResolveInsideOpt
 		return new PathGuardError("unreadable");
 	}
 
+	const requested = resolve(rootReal, p);
 	let target: string;
 	try {
-		target = realpathSync(resolve(rootReal, p));
+		target = realpathSync(requested);
 	} catch {
 		return new PathGuardError("unreadable");
 	}
 
 	if (!isPathInside(rootReal, target, caseInsensitive)) return new PathGuardError("outside_root");
-	if (isForbidden(relative(rootReal, target))) return new PathGuardError("forbidden");
+	// Check the name as requested and as resolved: a symlink must not launder
+	// `.env` into an innocent-looking target, nor the reverse.
+	if (isForbidden(relative(rootReal, requested)) || isForbidden(relative(rootReal, target))) {
+		return new PathGuardError("forbidden");
+	}
 
 	let info: ReturnType<typeof statSync>;
 	try {

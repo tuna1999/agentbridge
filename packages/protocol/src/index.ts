@@ -8,4 +8,5 @@ export * from "./match";
 export * from "./messages";
 export * from "./pathguard";
 export * from "./redact";
+export * from "./sanitize";
 export * from "./validate";

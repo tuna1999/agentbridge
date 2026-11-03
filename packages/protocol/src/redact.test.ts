@@ -18,6 +18,22 @@ test("redacts PEM private keys", () => {
 	assertRedacted(pem, "private_key");
 });
 
+test("redacts several PEM blocks and keeps the text between them", () => {
+	const dash = "-".repeat(5);
+	const block = (body: string) => [`${dash}BEGIN EC PRIVATE KEY${dash}`, body, `${dash}END EC PRIVATE KEY${dash}`].join("\n");
+	const result = redact(`a\n${block("K1")}\nb\n${block("K2")}\nc ${dash}BEGIN RSA PRIVATE KEY${dash} tail`);
+	expect(result.hits).toBe(2);
+	expect(result.text).toBe(`a\n[REDACTED:private_key]\nb\n[REDACTED:private_key]\nc ${dash}BEGIN RSA PRIVATE KEY${dash} tail`);
+});
+
+test("unterminated PEM headers are handled in linear time", () => {
+	const header = `${"-".repeat(5)}BEGIN A PRIVATE KEY${"-".repeat(5)}\n`;
+	const input = header.repeat(Math.floor(1_048_576 / header.length));
+	const started = performance.now();
+	expect(redact(input).hits).toBe(0);
+	expect(performance.now() - started).toBeLessThan(1_000);
+});
+
 test("does not redact a harmless private-key mention", () => {
 	const text = "This document explains what a PRIVATE KEY is.";
 	expect(redact(text)).toEqual({ text, hits: 0 });

@@ -34,6 +34,10 @@ beforeAll(() => {
 	chmodSync(join(root, "unreadable.txt"), 0o000);
 	symlinkSync(join(outside, "secret.txt"), join(root, "outside-link"));
 	symlinkSync(join(root, "notes.txt"), join(root, "inside-link"));
+	mkdirSync(join(root, "config"));
+	writeFileSync(join(root, "config", "prod.txt"), "DATABASE_URL=postgres://app:pw@db/prod");
+	symlinkSync("config/prod.txt", join(root, ".env"));
+	symlinkSync("../server.pem", join(root, "config", "tls-link.txt"));
 });
 
 afterAll(() => {
@@ -81,6 +85,15 @@ test("rejects symlinks that resolve outside", () => {
 
 test("rejects .env files", () => {
 	expect(reasonOf(resolveInside(root, ".env.local"))).toBe("forbidden");
+});
+
+test("rejects a forbidden name even when it is a symlink to an innocent-looking file", () => {
+	expect(reasonOf(resolveInside(root, ".env"))).toBe("forbidden");
+	expect(typeof resolveInside(root, "config/prod.txt")).toBe("string");
+});
+
+test("rejects an innocent-looking symlink that resolves to a forbidden file", () => {
+	expect(reasonOf(resolveInside(root, "config/tls-link.txt"))).toBe("forbidden");
 });
 
 test("rejects .env files case-insensitively", () => {

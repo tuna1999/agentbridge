@@ -5,7 +5,8 @@ export interface RedactResult {
 	hits: number;
 }
 
-const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
+const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
+const PRIVATE_KEY_END = /-----END [A-Z ]*PRIVATE KEY-----/g;
 const SECRET_ASSIGNMENT =
 	/(password|passwd|secret|token|api[_-]?key|access[_-]?key)['"]?\s*[:=]\s*['"]?((?!\[REDACTED:)[^\s'"]{8,})/gi;
 const GITHUB_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,})/g;
@@ -28,15 +29,40 @@ function placeholder(kind: string): string {
 	return `[REDACTED:${kind}]`;
 }
 
+/**
+ * `BEGIN … PRIVATE KEY` … nearest `END … PRIVATE KEY`, like the lazy regex
+ * `BEGIN[\s\S]*?END`, but linear: that regex rescans to the end of the input
+ * for every unmatched header, which a 1 MiB frame of headers turns into a
+ * multi-second stall of the OMP process. Once a header has no END after it,
+ * no later header can have one either.
+ */
+function redactPrivateKeys(input: string): RedactResult {
+	let output = "";
+	let cursor = 0;
+	let hits = 0;
+	PRIVATE_KEY_BEGIN.lastIndex = 0;
+	for (;;) {
+		const begin = PRIVATE_KEY_BEGIN.exec(input);
+		if (begin === null) break;
+		PRIVATE_KEY_END.lastIndex = begin.index + begin[0].length;
+		const end = PRIVATE_KEY_END.exec(input);
+		if (end === null) break;
+		output += `${input.slice(cursor, begin.index)}${placeholder("private_key")}`;
+		hits += 1;
+		cursor = end.index + end[0].length;
+		PRIVATE_KEY_BEGIN.lastIndex = cursor;
+	}
+	return { text: output + input.slice(cursor), hits };
+}
+
 export function redact(input: string): RedactResult {
 	let text = input;
 	let hits = 0;
 
 	// Multi-line PEM blocks first, so their body cannot trip the assignment rule.
-	text = text.replace(PRIVATE_KEY, () => {
-		hits += 1;
-		return placeholder("private_key");
-	});
+	const keys = redactPrivateKeys(text);
+	text = keys.text;
+	hits += keys.hits;
 
 	// `name = value` assignments: replace only the value, keep the name and operator.
 	text = text.replace(SECRET_ASSIGNMENT, (match, _name: string, value: string) => {

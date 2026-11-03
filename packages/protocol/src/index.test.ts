@@ -10,4 +10,5 @@ test("public surface exposes the protocol v1 API", () => {
 	expect(typeof protocol.newId).toBe("function");
 	expect(typeof protocol.redact).toBe("function");
 	expect(typeof protocol.resolveInside).toBe("function");
+	expect(typeof protocol.sanitizeText).toBe("function");
 });
