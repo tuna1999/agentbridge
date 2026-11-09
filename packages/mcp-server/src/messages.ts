@@ -230,6 +230,14 @@ export const CLI_MESSAGES = {
 	missingProjects: (projects: string[]) => `bỏ qua project không tồn tại: ${projects.join(", ")}`,
 	configPermissions: (path: string) =>
 		`${path} nên là file thường 0600 của user hiện tại; chat.autoApprove và /agentbridge allow|disallow sẽ từ chối file này`,
+	projectExtension: (files: string) =>
+		`${files} — OMP nạp extension trong repo mà không hỏi; xóa file này và chỉ dùng OMP plugin hoặc bản dev ở ~/.omp/agent/extensions`,
+	ompExtensionMissing: (devPath: string) =>
+		`chưa cài; cài plugin: \`omp plugin install agentbridge@agentbridge\` (dev: \`bun scripts/install.ts --apply\` → ${devPath})`,
+	claudePluginVersionMismatch: (id: string, installed: string, expected: string) =>
+		`${id} đang là ${installed}, bản clone này là ${expected}; cập nhật: \`claude plugin marketplace update agentbridge && claude plugin update ${id}\``,
+	ompPluginVersionMismatch: (installed: string, expected: string) =>
+		`OMP plugin đang là ${installed}, bản clone này là ${expected}; cập nhật: \`omp plugin marketplace update agentbridge && omp plugin upgrade agentbridge@agentbridge\``,
 	pluginRegistryUnreadable: (home: string) =>
 		`không đọc được ${home}/.claude/plugins/installed_plugins.json; chạy \`claude plugin list\` để tự kiểm tra (doctor không gọi claude)`,
 } as const;

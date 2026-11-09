@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliIO, parseCommand, parseFileSpec, parseInstalledPluginsJson, parseOmpPluginPackage, runCli } from "./cli";
 import { createFakeHost, DEFAULT_REPLY, type FakeHost, type FakeHostOptions, fakeConsultResult } from "./test-helpers";
+import packageJson from "../package.json";
 
 const SESSION_ID = "0199ab12-0000-7000-8000-000000000021";
 const INSTANCE_ID = "0199ab12-1111-7000-8000-000000000021";
@@ -126,8 +127,9 @@ async function tree(dir: string, prefix = ""): Promise<string[]> {
 }
 
 /** Mimic ~/.claude/plugins/installed_plugins.json + the cached plugin's .mcp.json. */
-async function addClaudePlugin(options: { mcp?: boolean } = {}): Promise<string> {
-	const pluginDir = join(homeDir, ".claude", "plugins", "cache", "agentbridge", "agentbridge", "1.0.0");
+async function addClaudePlugin(options: { mcp?: boolean; version?: string } = {}): Promise<string> {
+	const version = options.version ?? "1.0.0";
+	const pluginDir = join(homeDir, ".claude", "plugins", "cache", "agentbridge", "agentbridge", version);
 	await mkdir(join(pluginDir, ".claude-plugin"), { recursive: true });
 	await writeFile(join(pluginDir, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "agentbridge" }));
 	if (options.mcp !== false) {
@@ -141,7 +143,7 @@ async function addClaudePlugin(options: { mcp?: boolean } = {}): Promise<string>
 		JSON.stringify({
 			version: 2,
 			plugins: {
-				"agentbridge@agentbridge": [{ scope: "user", installPath: pluginDir, version: "1.0.0" }],
+				"agentbridge@agentbridge": [{ scope: "user", installPath: pluginDir, version }],
 			},
 		}),
 	);
@@ -149,7 +151,8 @@ async function addClaudePlugin(options: { mcp?: boolean } = {}): Promise<string>
 }
 
 /** Mimic ~/.omp/plugins/node_modules/<pkg>/package.json + omp-plugins.lock.json. */
-async function addOmpPlugin(options: { enabled?: boolean; extensions?: string[] } = {}): Promise<string> {
+async function addOmpPlugin(options: { enabled?: boolean; extensions?: string[]; version?: string } = {}): Promise<string> {
+	const version = options.version ?? "0.1.0";
 	const pluginsRoot = join(homeDir, ".omp", "plugins");
 	const pluginDir = join(pluginsRoot, "node_modules", "agentbridge");
 	await mkdir(pluginDir, { recursive: true });
@@ -157,14 +160,14 @@ async function addOmpPlugin(options: { enabled?: boolean; extensions?: string[] 
 		join(pluginDir, "package.json"),
 		JSON.stringify({
 			name: "agentbridge",
-			version: "0.1.0",
+			version,
 			omp: { extensions: options.extensions ?? ["./dist/agentbridge.js"] },
 		}),
 	);
 	await writeFile(
 		join(pluginsRoot, "omp-plugins.lock.json"),
 		JSON.stringify({
-			plugins: { agentbridge: { version: "0.1.0", enabledFeatures: null, enabled: options.enabled !== false } },
+			plugins: { agentbridge: { version, enabledFeatures: null, enabled: options.enabled !== false } },
 			settings: {},
 		}),
 	);
@@ -633,6 +636,43 @@ describe("ab doctor", () => {
 		expect(captured.stdout()).toContain("[ok] Claude plugin AgentBridge");
 		expect(captured.stdout()).toContain("[ok] OMP plugin AgentBridge");
 		expect(captured.stdout()).not.toContain("trùng cách cài");
+	});
+
+	test("warns when an installed plugin's version differs from this clone", async () => {
+		await addClaudePlugin({ version: "0.1.0" });
+		await addOmpPlugin({ version: "0.0.9" });
+		const captured = capture(projectDir);
+		const code = await runCli(["doctor"], captured.io);
+
+		expect(code).toBe(0);
+		expect(captured.stdout()).toContain("[ok] Claude plugin AgentBridge — agentbridge@agentbridge 0.1.0");
+		expect(captured.stdout()).toContain(
+			`[warn] version Claude plugin — agentbridge@agentbridge đang là 0.1.0, bản clone này là ${packageJson.version}`,
+		);
+		expect(captured.stdout()).toContain("claude plugin marketplace update agentbridge");
+		expect(captured.stdout()).toContain(
+			`[warn] version OMP plugin — OMP plugin đang là 0.0.9, bản clone này là ${packageJson.version}`,
+		);
+		expect(captured.stdout()).toContain("omp plugin marketplace update agentbridge");
+	});
+
+	test("does not warn about versions when the plugins match this clone", async () => {
+		await addClaudePlugin({ version: packageJson.version });
+		await addOmpPlugin({ version: packageJson.version });
+		const captured = capture(projectDir);
+		const code = await runCli(["doctor"], captured.io);
+
+		expect(code).toBe(0);
+		expect(captured.stdout()).not.toContain("[warn] version");
+	});
+
+	test("suggests the OMP plugin when no OMP extension is installed", async () => {
+		const captured = capture(projectDir);
+		const code = await runCli(["doctor"], captured.io);
+
+		expect(code).toBe(0);
+		expect(captured.stdout()).toContain("[warn] extension OMP — chưa cài");
+		expect(captured.stdout()).toContain("omp plugin install agentbridge@agentbridge");
 	});
 
 	test("warns about a dev extension plus an OMP plugin", async () => {

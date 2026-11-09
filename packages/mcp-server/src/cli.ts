@@ -28,6 +28,7 @@ import {
 	sessionJson,
 } from "./format";
 import { CLI_MESSAGES, CLI_USAGE, MCP_MESSAGES } from "./messages";
+import packageJson from "../package.json";
 
 export interface CliIO {
 	stdout(text: string): void;
@@ -49,6 +50,8 @@ function defaultIO(cwd?: string): CliIO {
 
 /** Consult/chat transport budget; matches the MCP tools' default `timeout_s`. */
 const CLI_TIMEOUT_MS = 600_000;
+/** The clone this CLI runs from; installed plugins are compared against it. */
+const CLI_VERSION: string = packageJson.version;
 
 function line(io: CliIO, text: string, stream: "stdout" | "stderr" = "stdout"): void {
 	io[stream](text.endsWith("\n") ? text : `${text}\n`);
@@ -349,6 +352,7 @@ export interface ClaudePluginState {
 	enabled: boolean;
 	id?: string;
 	installPath?: string;
+	version?: string;
 	mcpRegistered: boolean;
 	mcpKnown: boolean;
 }
@@ -472,6 +476,7 @@ export async function detectClaudePlugin(home: string): Promise<ClaudePluginStat
 		mcpKnown: servers !== undefined,
 	};
 	if (chosen.installPath !== undefined) state.installPath = chosen.installPath;
+	if (chosen.version !== undefined) state.version = chosen.version;
 	return state;
 }
 
@@ -713,7 +718,7 @@ async function projectExtensionCheck(cwd: string): Promise<DoctorCheck | undefin
 	return {
 		status: "warn",
 		label: "extension cấp project",
-		detail: `${matches.join(", ")} — OMP nạp extension trong repo mà không hỏi; xóa file này và chỉ dùng bản ở ~/.omp/agent/extensions`,
+		detail: CLI_MESSAGES.projectExtension(matches.join(", ")),
 	};
 }
 
@@ -784,7 +789,7 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 			detail: ompPlugin.enabled ? `do OMP plugin ${name} cung cấp` : `OMP plugin ${name} đang tắt`,
 		});
 	} else {
-		checks.push({ status: "warn", label: "extension OMP", detail: `chưa cài tại ${extension}` });
+		checks.push({ status: "warn", label: "extension OMP", detail: CLI_MESSAGES.ompExtensionMissing(extension) });
 	}
 
 	const projectExtension = await projectExtensionCheck(io.cwd);
@@ -848,10 +853,11 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 				detail: `${id} không khai báo MCP server agentbridge; ${commands}`,
 			});
 		} else {
+			const version = claudePlugin.version === undefined ? "" : ` ${claudePlugin.version}`;
 			checks.push({
 				status: "ok",
 				label: "Claude plugin AgentBridge",
-				detail: `${id} — MCP: agentbridge${claudePlugin.installPath === undefined ? "" : ` (${claudePlugin.installPath})`}; ${commands}`,
+				detail: `${id}${version} — MCP: agentbridge${claudePlugin.installPath === undefined ? "" : ` (${claudePlugin.installPath})`}; ${commands}`,
 			});
 		}
 	}
@@ -879,6 +885,27 @@ async function runDoctor(parsed: ParsedCommand, io: CliIO): Promise<number> {
 				detail: `${name}${version}${ompPlugin.path === undefined ? "" : ` (${ompPlugin.path})`}; ${commands}`,
 			});
 		}
+	}
+
+	// The same version string can name two builds, so a mismatch is the only
+	// signal doctor has that an installed plugin lacks this clone's fixes.
+	if (claudePlugin.installed && claudePlugin.version !== undefined && claudePlugin.version !== CLI_VERSION) {
+		checks.push({
+			status: "warn",
+			label: "version Claude plugin",
+			detail: CLI_MESSAGES.claudePluginVersionMismatch(
+				claudePlugin.id ?? "agentbridge@agentbridge",
+				claudePlugin.version,
+				CLI_VERSION,
+			),
+		});
+	}
+	if (ompPlugin.installed && ompPlugin.version !== undefined && ompPlugin.version !== CLI_VERSION) {
+		checks.push({
+			status: "warn",
+			label: "version OMP plugin",
+			detail: CLI_MESSAGES.ompPluginVersionMismatch(ompPlugin.version, CLI_VERSION),
+		});
 	}
 
 	if (extensionExists && ompPlugin.installed) {

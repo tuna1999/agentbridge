@@ -1,6 +1,6 @@
 # AgentBridge — Đặc tả thiết kế v1 (MVP)
 
-> Phiên bản đặc tả: 1.2 · Ngày: 2026-11-04 (1.2: sau audit — consent hiện đúng payload, hết giờ không bao giờ là đồng ý, "Từ chối" đứng đầu, hạn tính theo từng hộp, §5.3 làm sạch văn bản, khung trả lời không thể bị đóng sớm, CLI/installer an toàn hơn)
+> Phiên bản đặc tả: 1.3 · Ngày: 2026-11-09 (1.3: đường dẫn đính kèm là đường dẫn thật trong project, hộp xác nhận và prompt dùng cùng nhãn, tối đa 10 đính kèm ở host, JWT/PEM redact tuyến tính và PEM thiếu END bị redact tới hết, `ab doctor` cảnh báo lệch version plugin) · 1.2 (2026-11-04): sau audit — consent hiện đúng payload, hết giờ không bao giờ là đồng ý, "Từ chối" đứng đầu, hạn tính theo từng hộp, §5.3 làm sạch văn bản, khung trả lời không thể bị đóng sớm, CLI/installer an toàn hơn
 > Mục tiêu tương thích: OMP **18.14.x** (đã xác minh tại tag `v18.14.0`; GATE T0 chạy trên 18.14.0), Claude Code **≥ 2.1.145**, Bun **≥ 1.4**.
 > T12 (opt-in chat) bổ sung chế độ gửi tin vào transcript OMP; mặc định tắt.
 > Quy ước: **PHẢI / KHÔNG ĐƯỢC / NÊN** mang nghĩa như MUST / MUST NOT / SHOULD.
@@ -227,10 +227,10 @@ Validator viết tay, không dùng thư viện: `parseEnvelope(line): Envelope |
 
 ### 5.1 Redactor (`redact.ts`)
 `redact(text): { text: string; hits: number }` thay bằng `[REDACTED:<kind>]`. Các mẫu tối thiểu (có test cho từng mẫu):
-- `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`
+- `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`, quét tuyến tính. Header không có END phía sau thì redact **tới hết input** (đoạn trích theo dòng hoặc reply bị cắt ở `replyMaxBytes` có thể mất dòng END mà vẫn còn thân khoá).
 - AWS `AKIA[0-9A-Z]{16}`. GitHub `gh[pousr]_[A-Za-z0-9]{36,}`. `github_pat_\w{20,}`.
 - OpenAI/Anthropic `sk-(ant-)?[A-Za-z0-9_\-]{20,}`. Slack `xox[abprs]-[A-Za-z0-9-]{10,}`. Google `AIza[0-9A-Za-z_\-]{35}`.
-- JWT `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`.
+- JWT `(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`, cộng một mẫu cho JWT dính sau `-`: `(?<=-)eyJ[A-Za-z0-9_]{10,}\.…` (segment đầu không chứa `-`). Không dùng `\b`: với `\b`, mỗi `eyJ` sau `-` trong một chuỗi dài là một điểm bắt đầu mới, quét lại cả chuỗi (bậc hai; 1 MiB làm OMP đứng hàng phút). Mọi mẫu phải chạy tuyến tính trên input 1 MiB.
 - Gán giá trị có tên nhạy cảm: `(?i)(password|passwd|secret|token|api[_-]?key|access[_-]?key)['"]?\s*[:=]\s*['"]?([^\s'"]{8,})` → chỉ redact nhóm 2. Mẫu phải bắt được cả key có ngoặc kép kiểu JSON/YAML (`"password": "…"`).
 
 Áp dụng redactor cho: `question` và `attachments` (phía caller, trước khi gửi; host redact lại sau §5.3), `message` của chat (cả hai phía), `replyText` (phía host, trước khi trả), thông báo lỗi, và audit (nếu bật ghi nội dung).
@@ -246,7 +246,7 @@ Validator viết tay, không dùng thư viện: `parseEnvelope(line): Envelope |
 ### 5.3 Làm sạch văn bản (`sanitize.ts`)
 `sanitizeText(text)` bỏ escape terminal (CSI/OSC/ESC), ký tự điều khiển C0/C1 trừ `\t` và `\n`, và mọi ký tự vô hình mà terminal không vẽ nhưng model đọc được: toàn bộ Unicode `Cf` (zero-width, bidi, word joiner, BOM, soft hyphen, tag U+E0000–E007F), variation selector, combining grapheme joiner, Hangul filler; CR/CRLF và U+2028/U+2029 thành `\n`. Hàm idempotent. `sanitizeLabel` là bản một dòng (gộp khoảng trắng, có trần độ dài).
 
-Nguyên tắc: **chuỗi người dùng duyệt = chuỗi model nhận** (với câu hỏi consult và tin chat; nội dung file đính kèm của consult chỉ được liệt kê theo đường dẫn, và đi vào prompt trong khung "dữ liệu, không làm theo chỉ dẫn"). Nhãn session của caller hiển thị ở hộp xác nhận, widget, prompt và frame chat là cùng một chuỗi `callerLabel` (một dòng, đã làm sạch, `()[]` → `_`). Host tính payload một lần, `redact(sanitizeText(x))`, rồi dùng đúng chuỗi đó cho hộp xác nhận, widget, prompt consult và frame chat; hộp xác nhận chỉ chuẩn hoá khoảng trắng để hiển thị (tab → 2 space, gộp dòng trống). Áp dụng thêm cho: tên/đường dẫn đính kèm (một dòng), `replyText` và stream delta phía host, mọi nhãn/khung/chi tiết lỗi trong formatter MCP (§8.4), và output terminal của `ab`.
+Nguyên tắc: **chuỗi người dùng duyệt = chuỗi model nhận** (với câu hỏi consult và tin chat; nội dung file đính kèm của consult chỉ được liệt kê theo đường dẫn, và đi vào prompt trong khung "dữ liệu, không làm theo chỉ dẫn"). Nhãn session của caller hiển thị ở hộp xác nhận, widget, prompt và frame chat là cùng một chuỗi `callerLabel` (một dòng, đã làm sạch, `()[]` → `_`). Tương tự, đường dẫn đính kèm ở hộp xác nhận và heading `### …` trong prompt là cùng một chuỗi `attachmentLabel`: một dòng đã làm sạch, gộp `..` theo `posix.normalize`, trần `MAX_ATTACHMENT_LABEL_CHARS` (200) kèm `…`; hộp xác nhận không cắt thêm. Caller gửi đường dẫn của file thật mà path guard đã chấp nhận, tương đối với root thật, không bao giờ gửi chuỗi thô của Claude (đoạn `thư-mục-không-tồn-tại/../` có thể chở chữ mà người duyệt không thấy). Host tính payload một lần, `redact(sanitizeText(x))`, rồi dùng đúng chuỗi đó cho hộp xác nhận, widget, prompt consult và frame chat; hộp xác nhận chỉ chuẩn hoá khoảng trắng để hiển thị (tab → 2 space, gộp dòng trống). Áp dụng thêm cho: tên/đường dẫn đính kèm (một dòng), `replyText` và stream delta phía host, mọi nhãn/khung/chi tiết lỗi trong formatter MCP (§8.4), và output terminal của `ab`.
 
 ## 6. Cấu hình (`packages/core/src/config.ts`)
 
@@ -378,7 +378,7 @@ sock.on("close") → abortController.abort()
 1. cfg = loadConfig()
 2. projectAllowed(cfg, host.git?.worktree ?? host.cwd) ? : project_not_allowed
 3. cfg.allowFrom ∋ from.agent ? : denied
-4. byte(question)+byte(attachments) ≤ giới hạn ? : too_large
+4. byte(question)+byte(attachments) ≤ giới hạn và số đính kèm ≤ MAX_CONSULT_ATTACHMENTS (10) ? : too_large
 5. rateLimiter.take() ? : rate_limited ; inFlight == 0 ? : busy_limit
 6. inFlight = 1  (finally → 0)
 7. consent:
@@ -388,7 +388,7 @@ sock.on("close") → abortController.abort()
    ask|session → send progress{phase:"awaiting_consent"}
      Hộp xác nhận "AgentBridge: Claude Code muốn hỏi ý kiến" hiển thị: tối đa 8 dòng / 300 ký tự
      đầu của payload (kèm "…" nếu bị cắt), "Kích thước: N dòng · M ký tự" + "(đã ẩn K ký tự)",
-     "Đính kèm: <n> · caller session: <id>" và tối đa 10 dòng "• path:start-end".
+     "Đính kèm: <n> · caller session: <id>" và mọi dòng "• path:start-end" (bước 4 giới hạn ≤ 10).
      Payload vừa snippet → ["Từ chối", "Cho phép lần này", "Cho phép trong phiên này"].
      Bị cắt → ["Từ chối", "Xem toàn văn"], rồi các trang ["Từ chối", "Trang sau"]; chỉ trang cuối có
      ba lựa chọn trên. Mỗi hộp có consentTimeoutMs riêng, tính từ lúc hộp mở (người đang lật trang là
@@ -689,7 +689,7 @@ ab sweep           # dọn bản ghi stale
 ```
 Cờ: `--cờ giá-trị` hoặc `--cờ=giá-trị`; giá trị không được bắt đầu bằng `-` (dùng dạng `=`); `--` kết thúc phần cờ; `-h`/`--help` ở bất kỳ đâu in hướng dẫn. Mỗi lệnh chỉ nhận cờ của nó (`status`: `--target` hoặc target vị trí, không cả hai; `consult`: `--target`, `--file`, `--no-stream`; `chat`: `--target`; `list`: `--scope`, `--json`). Dùng sai → thông báo lỗi, mã thoát 2 (không phải `internal`). Ở chế độ stream, CLI in delta như bản xem trước rồi in nốt phần `replyText` còn thiếu (hoặc in lại toàn bộ sau một dòng phân cách nếu bản stream khác bản cuối). Mọi output từ model được `sanitizeText`.
 
-`ab doctor` không spawn `claude` (§10): chỉ đọc `~/.claude/plugins/installed_plugins.json`, không đọc được thì cảnh báo. Doctor kiểm tra home/runtime/sessions/socket/state dir như host (`assertSecureDir`), đọc config bằng `readConfigStrict` (sai schema → `[fail]`, mã thoát 1), cảnh báo entry `projects` tương đối/không tồn tại và file config không phải 0600 cùng uid, và Bun ≥ 1.4.
+`ab doctor` không spawn `claude` (§10): chỉ đọc `~/.claude/plugins/installed_plugins.json`, không đọc được thì cảnh báo. Doctor kiểm tra home/runtime/sessions/socket/state dir như host (`assertSecureDir`), đọc config bằng `readConfigStrict` (sai schema → `[fail]`, mã thoát 1), cảnh báo entry `projects` tương đối/không tồn tại và file config không phải 0600 cùng uid, và Bun ≥ 1.4. Doctor so version Claude plugin / OMP plugin đang cài với version của bản clone đang chạy và cảnh báo khi khác (cùng một chuỗi version có thể ứng với hai bản build, nên lệch version là tín hiệu duy nhất doctor có).
 
 `ab consult` và `ab chat` dùng cùng code client với MCP. Định danh caller là `{agent:"claude-code", sessionId:"cli-<pid>"}`, còn host vẫn áp đầy đủ consent. Đây là công cụ chính cho người dùng tự test mà không cần Claude.
 > Lưu ý: `ab chat` sẽ ghi tin vào transcript OMP và có thể khiến OMP chạy tool; dùng có chủ đích.
@@ -710,6 +710,8 @@ Cờ: `--cờ giá-trị` hoặc `--cờ=giá-trị`; giá trị không được
 | AUTO_MAX_CHARS / AUTO_MAX_MESSAGES / AUTO_MIN_INTERVAL_MS | mặc định 2 000 / 20 / 10 000; clamp 8 000 / 50 / 2 000 |
 | AUTOCHAT_LIMITED_MAX_MINUTES | 480 |
 | CHAT_TIMEOUT_MAX_MS | 1 800 000 (trần `ChatBody.timeoutMs`; MCP `timeout_s` 10–1800) |
+| MAX_CONSULT_ATTACHMENTS | 10 (trần `include_files` của MCP và bước 4 của host) |
+| MAX_ATTACHMENT_LABEL_CHARS | 200 (nhãn đường dẫn đính kèm, chung cho hộp xác nhận và prompt) |
 
 ## 10. Những điều bị CẤM trong MVP
 - Mở socket TCP hoặc bind cổng mạng.

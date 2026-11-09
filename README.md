@@ -56,12 +56,21 @@ Tuy nhiên OMP **có thể** nạp MCP server từ Claude plugin đã cài trong
 
 ### Cập nhật plugin
 
-Phiên bản hiện tại: **0.1.1**. Plugin chỉ được cập nhật khi version trong catalog tăng (nguồn duy nhất là `version` trong `package.json` gốc; `bun run build` đồng bộ sang `plugin.json`, `plugins/omp/package.json` và hai `marketplace.json`).
+Phiên bản hiện tại: **0.1.1**. Nguồn duy nhất của version là `version` trong `package.json` gốc; `bun run build` đồng bộ sang `plugin.json`, `plugins/omp/package.json` và hai `marketplace.json`. Mỗi bản phát hành **phải** tăng version:
+
+- Claude Code lấy version từ `plugin.json` và chỉ cập nhật khi version đó **khác** bản đang cài; commit mới cùng version không được tải về.
+- `omp plugin upgrade` không kèm tên coi plugin cùng version là đã mới nhất; `omp plugin upgrade agentbridge@agentbridge` thì cài lại.
+
+Làm mới catalog của marketplace trước, rồi mới cập nhật plugin:
 
 ```bash
+claude plugin marketplace update agentbridge
 claude plugin update agentbridge@agentbridge
+omp plugin marketplace update agentbridge
 omp plugin upgrade agentbridge@agentbridge
 ```
+
+Khởi động lại Claude Code và OMP sau khi cập nhật. Nếu có bản clone, `ab doctor` (§5) cảnh báo khi plugin đang cài khác version của bản clone.
 
 ### Gỡ plugin
 
@@ -197,6 +206,20 @@ Config được đọc lại ở mỗi request (cache theo mtime), không cần 
    - "hỏi OMP xem phiên của nó đang làm gì"
    - "bảo OMP chạy test và sửa lỗi giúp" (chỉ khi đã bật chat)
 
+### Lệnh `/agentbridge` trong OMP
+
+Gõ `/agentbridge ` rồi Tab để autocomplete. Các lệnh sửa config (`allow`, `disallow`) và `config` chỉ chạy trong main OMP TUI.
+
+| Lệnh | Tác dụng |
+|---|---|
+| `/agentbridge` hoặc `/agentbridge status` | Trạng thái server, phiên và autochat |
+| `/agentbridge allow` / `disallow` | Thêm / bỏ project hiện tại khỏi `projects` (có hỏi xác nhận) |
+| `/agentbridge config` | In tóm tắt config, không sửa |
+| `/agentbridge trust` / `untrust` | Bỏ qua / bật lại hộp xác nhận của **consult** cho phiên này (chỉ trong bộ nhớ; không áp dụng cho chat) |
+| `/agentbridge autochat off\|limited [phút]\|unlimited` | Chế độ tự duyệt chat, xem mục Autochat |
+| `/agentbridge off` / `on` | Tắt / bật lại server của phiên này (gỡ / ghi lại record, extension vẫn nạp) |
+| `/agentbridge clear` | Xoá widget ngay |
+
 ### Thử trong một thư mục sandbox (không cài ở scope user)
 
 Có thể thử mà không cài extension/MCP toàn cục: nạp extension bằng `-e` và MCP bằng `--mcp-config` chỉ cho một thư mục. `/path/to/agentbridge` là thư mục đã clone (ví dụ `~/agentbridge`).
@@ -222,7 +245,7 @@ Nếu OMP mở **không** có `-e`, hoặc Claude mở **không** có `--mcp-con
 
 Claude sẽ gọi `agent_list` (nếu cần) rồi `agent_consult` hoặc `agent_chat`. Với consult, lần đầu OMP hiện hộp xác nhận: cho phép một lần, cho phép trong phiên, hoặc từ chối. Từ chối thì Claude nhận `denied` và không được tự thử lại. Với chat, OMP hỏi Gửi/Từ chối cho từng tin, **trừ khi** người dùng đã bật autochat; `/agentbridge trust` của consult không bỏ qua bước này.
 
-Hộp xác nhận consult hiện câu hỏi (tối đa 8 dòng / 300 ký tự), dòng `Kích thước: N dòng · M ký tự`, số và đường dẫn các file đính kèm, cùng session của caller. Nếu phần xem trước bị cắt, dòng kích thước ghi thêm `(đã ẩn K ký tự)` và hộp đầu tiên chỉ có **Từ chối/Xem toàn văn**: các nút cho phép chỉ xuất hiện ở trang cuối, sau khi đã hiện hết câu hỏi (giống chat). Mỗi hộp, kể cả từng trang, có `consult.consentTimeoutMs` riêng tính từ lúc hộp mở; cả lượt xác nhận bị chặn ở 5 phút. Mỗi trang khoảng 1 000 ký tự / 14 dòng: câu hỏi 3 000 ký tự cần khoảng 5 hộp thoại, 8 000 ký tự khoảng 10. Code nên đi qua `include_files` (hộp xác nhận chỉ liệt kê đường dẫn).
+Hộp xác nhận consult hiện câu hỏi (tối đa 8 dòng / 300 ký tự), dòng `Kích thước: N dòng · M ký tự`, số và đường dẫn các file đính kèm, cùng session của caller. Nếu phần xem trước bị cắt, dòng kích thước ghi thêm `(đã ẩn K ký tự)` và hộp đầu tiên chỉ có **Từ chối/Xem toàn văn**: các nút cho phép chỉ xuất hiện ở trang cuối, sau khi đã hiện hết câu hỏi (giống chat). Mỗi hộp, kể cả từng trang, có `consult.consentTimeoutMs` riêng tính từ lúc hộp mở; cả lượt xác nhận bị chặn ở 5 phút. Mỗi trang khoảng 1 000 ký tự / 14 dòng: câu hỏi 3 000 ký tự cần khoảng 5 hộp thoại, 8 000 ký tự khoảng 10. Code nên đi qua `include_files` (hộp xác nhận chỉ liệt kê đường dẫn). Đường dẫn trong hộp xác nhận và trong prompt gửi model là **cùng một chuỗi**: đường dẫn tương đối của file thật trong project (không giữ đoạn `../` hay tên thư mục không tồn tại mà caller gửi), tối đa 200 ký tự, bị cắt thì có `…`.
 
 Hết thời gian chờ **không bao giờ** được tính là đồng ý. Selector của OMP tự chọn mục đang được trỏ khi đếm ngược hết, nên AgentBridge đặt **Từ chối** ở đầu danh sách và trỏ sẵn vào nó (Enter theo phản xạ cũng là từ chối), và coi lựa chọn đến sau hạn của hộp là hết giờ. Điều này áp dụng cho consult, chat và `/agentbridge allow|disallow`.
 
@@ -236,7 +259,7 @@ Trong chế độ consult:
 - file phiên OMP **không đổi byte nào** (GATE G2 đã kiểm tra bằng sha256);
 - câu trả lời được đóng khung là dữ liệu từ agent khác.
 
-Có thể đính kèm đoạn code bằng `include_files`; OMP không tự đọc file trong project. `include_files` bị chặn bởi path guard (`.env`, khóa, `.git`, `.ssh`, `.aws`, `.claude`, `.omp`, `node_modules`, symlink ra ngoài, file nhị phân, file > 256 KiB).
+Có thể đính kèm đoạn code bằng `include_files`; OMP không tự đọc file trong project. `include_files` bị chặn bởi path guard (`.env`, khóa, `.git`, `.ssh`, `.aws`, `.claude`, `.omp`, `node_modules`, symlink ra ngoài, file nhị phân, file > 256 KiB). Tối đa 10 file mỗi consult; host cũng từ chối (`too_large`) consult có hơn 10 đính kèm, để hộp xác nhận luôn liệt kê đủ.
 
 ### Chế độ chat (opt-in)
 
@@ -246,7 +269,7 @@ Chat **mặc định tắt**. Bật bằng:
 "chat": { "enabled": true, "queueWhenBusy": false, "consentTimeoutMs": 120000 }
 ```
 
-Sau khi bật và mở lại OMP (hoặc chờ heartbeat cập nhật record), Claude có tool `agent_chat { message, target?, timeout_s? }`:
+Tool `agent_chat { message, target?, timeout_s? }` luôn có trong danh sách tool của Claude; khi chat đang tắt, nó trả `chat_disabled`. Sau khi bật và mở lại OMP (hoặc chờ heartbeat cập nhật record), phiên OMP có capability `chat` và nhận tin:
 
 - Tin được bọc nguồn gửi: `[Tin nhắn từ Claude Code (phiên <id>), chuyển qua AgentBridge — không phải người dùng gõ]` rồi mới tới nội dung.
 - Tin **đi vào transcript OMP** và OMP trả lời trong cùng phiên; OMP có thể dùng tool, sửa file hoặc chạy lệnh theo quyền của chính nó. Đây là khác biệt cốt lõi so với consult. Tin được gửi với `attribution: "agent"` (nguồn là Claude Code, không phải người dùng gõ).
@@ -352,7 +375,7 @@ Widget không ghi vào file session, không append message và không đi vào c
 
 ## 5. CLI `ab`
 
-CLI dùng cùng code client với MCP server, hữu ích để tự kiểm tra mà không cần Claude:
+CLI dùng cùng code client với MCP server, hữu ích để tự kiểm tra mà không cần Claude. CLI **không** có trong plugin: cần bản clone đã `bun install --frozen-lockfile` (xem §10), rồi chạy từ thư mục clone:
 
 ```bash
 bun packages/mcp-server/src/cli.ts list [--scope worktree|repo|all] [--json]
@@ -489,7 +512,7 @@ rm -rf ~/agentbridge
 | `busy_limit` / `rate_limited` | Đang có consult khác hoặc vượt 6 consult/phút | Đợi rồi thử lại khi người dùng đồng ý |
 | `chat_disabled` | `chat.enabled` đang `false` | Hỏi người dùng có muốn bật chat trong config không; không tự sửa config |
 | `busy` | OMP đang bận hoặc đã có chat khác chờ | Đợi lượt hiện tại; chỉ bật `chat.queueWhenBusy` nếu người dùng đồng ý |
-| Doctor báo `extension cấp project` | Repo có `.omp/extensions/*agentbridge*` | Xóa file đó; chỉ dùng bản ở `~/.omp/agent/extensions/` |
+| Doctor báo `extension cấp project` | Repo có `.omp/extensions/*agentbridge*` | Xóa file đó; chỉ dùng OMP plugin (`omp plugin install agentbridge@agentbridge`) hoặc bản dev ở `~/.omp/agent/extensions/` |
 | Doctor báo `trùng cách cài AgentBridge` | Cài cả plugin lẫn dev extension/MCP thủ công | Gỡ một bên: `bun scripts/install.ts --uninstall` hoặc `claude mcp remove -s user agentbridge`, `omp plugin uninstall agentbridge@agentbridge` |
 | Doctor báo `thư mục legacy XDG` | Còn `~/.config/agentbridge`, `~/.local/state/agentbridge` hoặc `$XDG_RUNTIME_DIR/agentbridge` từ bản cũ | Tự chuyển config/state vào `~/.agentbridge` (hoặc đặt `AGENTBRIDGE_HOME`) rồi xóa thư mục cũ; AgentBridge không tự di chuyển |
 
