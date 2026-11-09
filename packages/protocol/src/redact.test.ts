@@ -22,15 +22,26 @@ test("redacts several PEM blocks and keeps the text between them", () => {
 	const dash = "-".repeat(5);
 	const block = (body: string) => [`${dash}BEGIN EC PRIVATE KEY${dash}`, body, `${dash}END EC PRIVATE KEY${dash}`].join("\n");
 	const result = redact(`a\n${block("K1")}\nb\n${block("K2")}\nc ${dash}BEGIN RSA PRIVATE KEY${dash} tail`);
-	expect(result.hits).toBe(2);
-	expect(result.text).toBe(`a\n[REDACTED:private_key]\nb\n[REDACTED:private_key]\nc ${dash}BEGIN RSA PRIVATE KEY${dash} tail`);
+	expect(result.hits).toBe(3);
+	expect(result.text).toBe(`a\n[REDACTED:private_key]\nb\n[REDACTED:private_key]\nc [REDACTED:private_key]`);
+});
+
+test("a PEM block cut before its END line is redacted to the end of the input", () => {
+	const dash = "-".repeat(5);
+	const keyBody = "MIIEowIBAAKCAQEA1234567890abcdef";
+	const sliced = ["deploy notes", `${dash}BEGIN OPENSSH PRIVATE KEY${dash}`, keyBody, `${keyBody}xyz`].join("\n");
+	const result = redact(sliced);
+	expect(result.hits).toBe(1);
+	expect(result.text).toBe("deploy notes\n[REDACTED:private_key]");
+	expect(result.text).not.toContain(keyBody);
+	expect(redact(result.text)).toEqual({ text: result.text, hits: 0 });
 });
 
 test("unterminated PEM headers are handled in linear time", () => {
 	const header = `${"-".repeat(5)}BEGIN A PRIVATE KEY${"-".repeat(5)}\n`;
 	const input = header.repeat(Math.floor(1_048_576 / header.length));
 	const started = performance.now();
-	expect(redact(input).hits).toBe(0);
+	expect(redact(input)).toEqual({ text: "[REDACTED:private_key]", hits: 1 });
 	expect(performance.now() - started).toBeLessThan(1_000);
 });
 
@@ -69,6 +80,27 @@ test("redacts Google API keys", () => {
 test("redacts JWTs", () => {
 	assertRedacted(`eyJ${"a".repeat(10)}.${"b".repeat(10)}.${"c".repeat(10)}`, "jwt");
 	expect(redact(`eyJ${"a".repeat(10)}.${"b".repeat(10)}`).hits).toBe(0);
+});
+
+test("redacts JWTs after a space, a quote, a dot and a dash, but not inside a word", () => {
+	const jwt = `eyJhbGciOiJIUzI1NiJ9.${"b".repeat(12)}.${"c-d_".repeat(4)}`;
+	for (const prefix of ["Bearer ", '"', "x.", "--token-"]) {
+		const result = redact(`${prefix}${jwt} tail`);
+		expect(result.hits).toBe(1);
+		expect(result.text).toBe(`${prefix}[REDACTED:jwt] tail`);
+	}
+	expect(redact(`abc${jwt}`).hits).toBe(0);
+	expect(redact(`_${jwt}`).hits).toBe(0);
+});
+
+test("adversarial JWT-like runs are redacted in linear time", () => {
+	// Quadratic matching took ~6 s on 256 KiB of `eyJ-`.
+	for (const unit of ["eyJ-", "-eyJ", "eyJ_-", `eyJ${"a".repeat(12)}.`, `-eyJ${"a".repeat(12)}.b-`]) {
+		const input = unit.repeat(Math.floor(262_144 / unit.length));
+		const started = performance.now();
+		redact(input);
+		expect(performance.now() - started).toBeLessThan(1_000);
+	}
 });
 
 test("redacts named secret assignments but keeps the key", () => {

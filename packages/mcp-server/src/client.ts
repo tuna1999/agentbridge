@@ -1,5 +1,6 @@
 /** Shared client logic for MCP tools and the `ab` CLI. Spec: 01 §8.2–8.5. */
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { relative, sep } from "node:path";
 import {
 	checkLiveness,
 	hello,
@@ -17,6 +18,7 @@ import {
 	type ConsultBody,
 	type ConsultResult,
 	LIVENESS_HELLO_TIMEOUT_MS,
+	MAX_CONSULT_ATTACHMENTS,
 	type MatchSummary,
 	PathGuardError,
 	type Peer,
@@ -31,7 +33,7 @@ import {
 import { BridgeError, type TargetOption } from "./errors";
 import { MCP_MESSAGES } from "./messages";
 
-export const MAX_INCLUDE_FILES = 10;
+export const MAX_INCLUDE_FILES = MAX_CONSULT_ATTACHMENTS;
 export const MAX_INCLUDE_BYTES = 65_536;
 /** Per-file guard checked before reading; a 2 MiB sparse file must never be loaded. */
 export const MAX_INCLUDE_FILE_BYTES = 1_048_576;
@@ -365,6 +367,15 @@ function sliceLines(text: string, path: string, startLine?: number, endLine?: nu
 	};
 }
 
+/**
+ * The name an include travels under: the real file the path guard accepted,
+ * relative to the real root. Never the caller's raw string, whose `missing/../`
+ * segments could smuggle text into the OMP prompt (01 §5.3).
+ */
+function includeLabel(rootReal: string, resolved: string): string {
+	return relative(rootReal, resolved).split(sep).join("/");
+}
+
 /** Read, slice, redact, and cap include_files. Spec: 01 §8.3 step 2 and §5.2. */
 export async function readIncludeFiles(
 	root: string,
@@ -382,6 +393,7 @@ export async function readIncludeFiles(
 
 	const attachments: ConsultAttachment[] = [];
 	let totalBytes = 0;
+	let rootReal: string | undefined;
 	for (const file of files) {
 		const resolved = resolveInside(root, file.path, { caseInsensitive });
 		if (resolved instanceof Error) {
@@ -451,7 +463,9 @@ export async function readIncludeFiles(
 			);
 		}
 
-		const attachment: ConsultAttachment = { path: file.path, text: redacted };
+		// resolveInside has just realpath'd the same root.
+		rootReal ??= await realpath(root);
+		const attachment: ConsultAttachment = { path: includeLabel(rootReal, resolved), text: redacted };
 		if (sliced.startLine !== undefined) attachment.startLine = sliced.startLine;
 		if (sliced.endLine !== undefined) attachment.endLine = sliced.endLine;
 		attachments.push(attachment);

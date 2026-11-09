@@ -17,7 +17,6 @@ export const CONSULT_TEXT = {
 	attachmentsLine: (count: number, callerSession: string) =>
 		`Đính kèm: ${count} · caller session: ${callerSession}`,
 	attachmentItem: (location: string) => `  • ${location}`,
-	moreAttachments: (count: number) => `  … và ${count} tệp khác`,
 	answered: (durationMs: number) => `AgentBridge: đã trả lời Claude (${durationMs}ms)`,
 	widgetHeader: (caller: string) => `◆ AgentBridge · Claude đang hỏi · ${caller}`,
 	widgetDone: (durationMs: number) => `✓ đã trả lời Claude (${durationMs}ms)`,

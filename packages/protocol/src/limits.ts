@@ -23,3 +23,10 @@ export const CONSENT_TOTAL_MAX_MS = 300_000;
 export const CHAT_TIMEOUT_MAX_MS = 1_800_000;
 /** Per-file attachment cap from the path guard (01 §5.2): 256 KiB. */
 export const MAX_ATTACHMENT_FILE_BYTES = 262_144;
+/**
+ * Attachments per consult: the MCP `include_files` cap and the host gate
+ * (01 §7.4 step 4), so the consent dialog can always list every one.
+ */
+export const MAX_CONSULT_ATTACHMENTS = 10;
+/** Attachment label as both the consent dialog and the prompt show it (01 §5.3). */
+export const MAX_ATTACHMENT_LABEL_CHARS = 200;

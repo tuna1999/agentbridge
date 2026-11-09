@@ -4,6 +4,7 @@
  * envelopes, identity, clock skew and request ids; this module owns policy,
  * consent, rate/concurrency limits and the ephemeral turn.
  */
+import { posix } from "node:path";
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
 import {
  CONSENT_TOTAL_MAX_MS,
@@ -14,6 +15,8 @@ import {
  DEDUPE_LRU,
  DEDUPE_TTL_MS,
  type ErrorCode,
+ MAX_ATTACHMENT_LABEL_CHARS,
+ MAX_CONSULT_ATTACHMENTS,
  type ModelRef,
  type Peer,
  type ProgressBody,
@@ -54,10 +57,6 @@ const CONSENT_APPROVE_OPTIONS: readonly string[] = [CONSULT_TEXT.allowOnce, CONS
 export const CONSENT_OPTIONS: readonly string[] = [CONSULT_TEXT.deny, ...CONSENT_APPROVE_OPTIONS];
 export const CONSENT_TITLE = CONSULT_TEXT.consentTitle;
 const CONSENT_SESSION_CHARS = 128;
-/** Attachment locations listed in the consent dialog before "… và K tệp khác". */
-const CONSENT_MAX_ATTACHMENTS = 10;
-/** Attachment paths come from the caller; keep them to one bounded line. */
-const ATTACHMENT_PATH_CHARS = 512;
 
 export interface ConsultRequest {
  ctx: OmpContextLike;
@@ -174,7 +173,7 @@ function consultPayload(body: ConsultBody): { question: string; attachments: Con
  const question = redact(sanitizeText(body.question)).text;
  const attachments = (body.attachments ?? []).map((attachment) => {
   const clean: ConsultAttachment = {
-   path: sanitizeLabel(attachment.path, ATTACHMENT_PATH_CHARS),
+   path: attachmentLabel(attachment.path),
    text: redact(sanitizeText(attachment.text)).text,
   };
   if (attachment.startLine !== undefined) clean.startLine = attachment.startLine;
@@ -182,6 +181,16 @@ function consultPayload(body: ConsultBody): { question: string; attachments: Con
   return clean;
  });
  return { question, attachments };
+}
+
+/**
+ * The attachment path as both the consent dialog and the prompt show it: one
+ * sanitized line with `..` segments collapsed and one shared cap, so a path
+ * like `a/b/<hidden text>/../../README.md` cannot carry text past the operator.
+ */
+export function attachmentLabel(path: string): string {
+ const line = sanitizeLabel(path, Number.POSITIVE_INFINITY);
+ return sanitizeLabel(posix.normalize(line), MAX_ATTACHMENT_LABEL_CHARS);
 }
 
 function consentTitle(
@@ -196,11 +205,10 @@ function consentTitle(
  if (page !== undefined) lines.push(CONSENT_TEXT.page(page.index, page.total));
  if (body.length > 0) lines.push(body, "");
  lines.push(sizeLine, CONSULT_TEXT.attachmentsLine(attachments.length, callerSession));
- for (const attachment of attachments.slice(0, CONSENT_MAX_ATTACHMENTS)) {
-  lines.push(CONSULT_TEXT.attachmentItem(sanitizeDialogText(locationOf(attachment), 160, 1)));
- }
- if (attachments.length > CONSENT_MAX_ATTACHMENTS) {
-  lines.push(CONSULT_TEXT.moreAttachments(attachments.length - CONSENT_MAX_ATTACHMENTS));
+ // Every attachment, uncut: labels are already bounded and the gate caps
+ // the count, so the operator sees each heading exactly as the model does.
+ for (const attachment of attachments) {
+  lines.push(CONSULT_TEXT.attachmentItem(sanitizeDialogText(locationOf(attachment), Number.POSITIVE_INFINITY, 1)));
  }
  return lines.join("\n");
 }
@@ -565,6 +573,7 @@ export class ConsultManager {
    const attachments = request.body.attachments ?? [];
    if (
     Buffer.byteLength(request.body.question, "utf8") > config.consult.maxQuestionBytes ||
+    attachments.length > MAX_CONSULT_ATTACHMENTS ||
     attachmentBytes(attachments) > config.consult.maxAttachmentBytes
    ) {
     throw new ConsultFailure("too_large", "question or attachments exceed the configured limit");
