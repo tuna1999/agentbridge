@@ -6976,7 +6976,7 @@ var require_dist = __commonJS(function(exports, module) {
 // packages/mcp-server/package.json
 var package_default = {
   name: "@agentbridge/mcp-server",
-  version: "0.1.1",
+  version: "0.1.2",
   private: true,
   type: "module",
   exports: {
@@ -21713,6 +21713,7 @@ var LIVENESS_HELLO_TIMEOUT_MS = 2000;
 var DEFAULT_MAX_QUESTION_BYTES = 32768;
 var CHAT_TIMEOUT_MAX_MS = 1800000;
 var MAX_ATTACHMENT_FILE_BYTES = 262144;
+var MAX_CONSULT_ATTACHMENTS = 10;
 
 // packages/protocol/src/messages.ts
 var PATH_GUARD_MESSAGES = {
@@ -21949,14 +21950,16 @@ var AWS_ACCESS_KEY = /\bAKIA[0-9A-Z]{16}\b/g;
 var OPENAI_KEY = /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}/g;
 var SLACK_TOKEN = /\bxox[abprs]-[A-Za-z0-9-]{10,}/g;
 var GOOGLE_API_KEY = /\bAIza[0-9A-Za-z_-]{35}/g;
-var JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+var JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+var JWT_AFTER_DASH = /(?<=-)eyJ[A-Za-z0-9_]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
 var TOKEN_RULES = [
   { kind: "github_token", pattern: GITHUB_TOKEN },
   { kind: "aws_access_key", pattern: AWS_ACCESS_KEY },
   { kind: "openai_key", pattern: OPENAI_KEY },
   { kind: "slack_token", pattern: SLACK_TOKEN },
   { kind: "google_api_key", pattern: GOOGLE_API_KEY },
-  { kind: "jwt", pattern: JWT }
+  { kind: "jwt", pattern: JWT },
+  { kind: "jwt", pattern: JWT_AFTER_DASH }
 ];
 function placeholder(kind) {
   return `[REDACTED:${kind}]`;
@@ -21972,8 +21975,12 @@ function redactPrivateKeys(input) {
       break;
     PRIVATE_KEY_END.lastIndex = begin.index + begin[0].length;
     const end = PRIVATE_KEY_END.exec(input);
-    if (end === null)
+    if (end === null) {
+      output += `${input.slice(cursor, begin.index)}${placeholder("private_key")}`;
+      hits += 1;
+      cursor = input.length;
       break;
+    }
     output += `${input.slice(cursor, begin.index)}${placeholder("private_key")}`;
     hits += 1;
     cursor = end.index + end[0].length;
@@ -23199,7 +23206,8 @@ function logError(message, error) {
 }
 
 // packages/mcp-server/src/client.ts
-import { readFile as readFile3, stat as stat2 } from "fs/promises";
+import { readFile as readFile3, realpath as realpath3, stat as stat2 } from "fs/promises";
+import { relative as relative2, sep as sep2 } from "path";
 
 // packages/mcp-server/src/messages.ts
 var TOOL_DESCRIPTIONS = {
@@ -23446,7 +23454,7 @@ function formatFailure(failure) {
 }
 
 // packages/mcp-server/src/client.ts
-var MAX_INCLUDE_FILES = 10;
+var MAX_INCLUDE_FILES = MAX_CONSULT_ATTACHMENTS;
 var MAX_INCLUDE_BYTES = 65536;
 var MAX_INCLUDE_FILE_BYTES = 1048576;
 function normalizePath2(path, caseInsensitive) {
@@ -23647,6 +23655,9 @@ function sliceLines(text, path, startLine, endLine) {
     endLine: effectiveEnd
   };
 }
+function includeLabel(rootReal, resolved) {
+  return relative2(rootReal, resolved).split(sep2).join("/");
+}
 async function readIncludeFiles(root, files, caseInsensitive) {
   if (files.length === 0)
     return [];
@@ -23655,6 +23666,7 @@ async function readIncludeFiles(root, files, caseInsensitive) {
   }
   const attachments = [];
   let totalBytes = 0;
+  let rootReal;
   for (const file of files) {
     const resolved = resolveInside(root, file.path, { caseInsensitive });
     if (resolved instanceof Error) {
@@ -23686,7 +23698,8 @@ async function readIncludeFiles(root, files, caseInsensitive) {
     if (totalBytes > MAX_INCLUDE_BYTES) {
       throw new BridgeError("include_too_large", MCP_MESSAGES.includeTooLarge, MCP_MESSAGES.includeTooLargeHint, undefined, `${totalBytes} byte`);
     }
-    const attachment = { path: file.path, text: redacted };
+    rootReal ??= await realpath3(root);
+    const attachment = { path: includeLabel(rootReal, resolved), text: redacted };
     if (sliced.startLine !== undefined)
       attachment.startLine = sliced.startLine;
     if (sliced.endLine !== undefined)

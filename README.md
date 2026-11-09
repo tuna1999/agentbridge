@@ -56,7 +56,7 @@ Tuy nhiên OMP **có thể** nạp MCP server từ Claude plugin đã cài trong
 
 ### Cập nhật plugin
 
-Phiên bản hiện tại: **0.1.1**. Nguồn duy nhất của version là `version` trong `package.json` gốc; `bun run build` đồng bộ sang `plugin.json`, `plugins/omp/package.json` và hai `marketplace.json`. Mỗi bản phát hành **phải** tăng version:
+Phiên bản hiện tại: **0.1.2**. Nguồn duy nhất của version là `version` trong `package.json` gốc; `bun run build` đồng bộ sang `plugin.json`, `plugins/omp/package.json` và hai `marketplace.json`. Mỗi bản phát hành **phải** tăng version:
 
 - Claude Code lấy version từ `plugin.json` và chỉ cập nhật khi version đó **khác** bản đang cài; commit mới cùng version không được tải về.
 - `omp plugin upgrade` không kèm tên coi plugin cùng version là đã mới nhất; `omp plugin upgrade agentbridge@agentbridge` thì cài lại.

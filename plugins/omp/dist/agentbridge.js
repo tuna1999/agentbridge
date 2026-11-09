@@ -2,7 +2,7 @@
 // packages/omp-extension/package.json
 var package_default = {
   name: "@agentbridge/omp-extension",
-  version: "0.1.1",
+  version: "0.1.2",
   private: true,
   type: "module",
   exports: { ".": "./src/index.ts" },
@@ -90,6 +90,8 @@ var CONSULT_CONCURRENCY = 1;
 var DEFAULT_MAX_QUESTION_BYTES = 32768;
 var CONSENT_TOTAL_MAX_MS = 300000;
 var CHAT_TIMEOUT_MAX_MS = 1800000;
+var MAX_CONSULT_ATTACHMENTS = 10;
+var MAX_ATTACHMENT_LABEL_CHARS = 200;
 
 // packages/protocol/src/messages.ts
 var FRAME_TOO_LARGE_MESSAGE = "Frame v\u01B0\u1EE3t qu\xE1 gi\u1EDBi h\u1EA1n 1 MiB.";
@@ -146,14 +148,16 @@ var AWS_ACCESS_KEY = /\bAKIA[0-9A-Z]{16}\b/g;
 var OPENAI_KEY = /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}/g;
 var SLACK_TOKEN = /\bxox[abprs]-[A-Za-z0-9-]{10,}/g;
 var GOOGLE_API_KEY = /\bAIza[0-9A-Za-z_-]{35}/g;
-var JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+var JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+var JWT_AFTER_DASH = /(?<=-)eyJ[A-Za-z0-9_]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
 var TOKEN_RULES = [
   { kind: "github_token", pattern: GITHUB_TOKEN },
   { kind: "aws_access_key", pattern: AWS_ACCESS_KEY },
   { kind: "openai_key", pattern: OPENAI_KEY },
   { kind: "slack_token", pattern: SLACK_TOKEN },
   { kind: "google_api_key", pattern: GOOGLE_API_KEY },
-  { kind: "jwt", pattern: JWT }
+  { kind: "jwt", pattern: JWT },
+  { kind: "jwt", pattern: JWT_AFTER_DASH }
 ];
 function placeholder(kind) {
   return `[REDACTED:${kind}]`;
@@ -169,8 +173,12 @@ function redactPrivateKeys(input) {
       break;
     PRIVATE_KEY_END.lastIndex = begin.index + begin[0].length;
     const end = PRIVATE_KEY_END.exec(input);
-    if (end === null)
+    if (end === null) {
+      output += `${input.slice(cursor, begin.index)}${placeholder("private_key")}`;
+      hits += 1;
+      cursor = input.length;
       break;
+    }
     output += `${input.slice(cursor, begin.index)}${placeholder("private_key")}`;
     hits += 1;
     cursor = end.index + end[0].length;
@@ -1815,7 +1823,6 @@ var CONSULT_TEXT = {
   deny: "T\u1EEB ch\u1ED1i",
   attachmentsLine: (count, callerSession) => `\u0110\xEDnh k\xE8m: ${count} \xB7 caller session: ${callerSession}`,
   attachmentItem: (location) => `  \u2022 ${location}`,
-  moreAttachments: (count) => `  \u2026 v\xE0 ${count} t\u1EC7p kh\xE1c`,
   answered: (durationMs) => `AgentBridge: \u0111\xE3 tr\u1EA3 l\u1EDDi Claude (${durationMs}ms)`,
   widgetHeader: (caller) => `\u25C6 AgentBridge \xB7 Claude \u0111ang h\u1ECFi \xB7 ${caller}`,
   widgetDone: (durationMs) => `\u2713 \u0111\xE3 tr\u1EA3 l\u1EDDi Claude (${durationMs}ms)`,
@@ -2134,6 +2141,7 @@ import { realpath as realpath5 } from "fs/promises";
 import { join as join5, resolve as resolve4 } from "path";
 
 // packages/omp-extension/src/consult.ts
+import { posix as posix2 } from "path";
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "timers";
 
 // packages/omp-extension/src/omp.ts
@@ -2461,8 +2469,6 @@ var CONSENT_APPROVE_OPTIONS = [CONSULT_TEXT.allowOnce, CONSULT_TEXT.allowSession
 var CONSENT_OPTIONS = [CONSULT_TEXT.deny, ...CONSENT_APPROVE_OPTIONS];
 var CONSENT_TITLE = CONSULT_TEXT.consentTitle;
 var CONSENT_SESSION_CHARS = 128;
-var CONSENT_MAX_ATTACHMENTS = 10;
-var ATTACHMENT_PATH_CHARS = 512;
 var MAX_TOKENS_REJECTION = /does not support maxTokens|cannot preserve maxTokens/i;
 var MODEL_OR_SESSION_CHANGED = /Active (?:model|session) changed/i;
 var USAGE_FIELDS2 = ["input", "output", "cacheRead", "cacheWrite", "cost"];
@@ -2541,7 +2547,7 @@ function consultPayload(body) {
   const question = redact(sanitizeText(body.question)).text;
   const attachments = (body.attachments ?? []).map((attachment) => {
     const clean = {
-      path: sanitizeLabel(attachment.path, ATTACHMENT_PATH_CHARS),
+      path: attachmentLabel(attachment.path),
       text: redact(sanitizeText(attachment.text)).text
     };
     if (attachment.startLine !== undefined)
@@ -2552,6 +2558,10 @@ function consultPayload(body) {
   });
   return { question, attachments };
 }
+function attachmentLabel(path) {
+  const line = sanitizeLabel(path, Number.POSITIVE_INFINITY);
+  return sanitizeLabel(posix2.normalize(line), MAX_ATTACHMENT_LABEL_CHARS);
+}
 function consentTitle(request, attachments, sizeLine, body, page) {
   const callerSession = sanitizeDialogText(callerLabel(request.from.sessionId), CONSENT_SESSION_CHARS, 1);
   const lines = [CONSENT_TITLE, ""];
@@ -2560,11 +2570,8 @@ function consentTitle(request, attachments, sizeLine, body, page) {
   if (body.length > 0)
     lines.push(body, "");
   lines.push(sizeLine, CONSULT_TEXT.attachmentsLine(attachments.length, callerSession));
-  for (const attachment of attachments.slice(0, CONSENT_MAX_ATTACHMENTS)) {
-    lines.push(CONSULT_TEXT.attachmentItem(sanitizeDialogText(locationOf(attachment), 160, 1)));
-  }
-  if (attachments.length > CONSENT_MAX_ATTACHMENTS) {
-    lines.push(CONSULT_TEXT.moreAttachments(attachments.length - CONSENT_MAX_ATTACHMENTS));
+  for (const attachment of attachments) {
+    lines.push(CONSULT_TEXT.attachmentItem(sanitizeDialogText(locationOf(attachment), Number.POSITIVE_INFINITY, 1)));
   }
   return lines.join(`
 `);
@@ -2831,7 +2838,7 @@ class ConsultManager {
         throw new ConsultFailure("denied", `agent is not allowed: ${request.from.agent}`, "denied");
       }
       const attachments = request.body.attachments ?? [];
-      if (Buffer.byteLength(request.body.question, "utf8") > config.consult.maxQuestionBytes || attachmentBytes(attachments) > config.consult.maxAttachmentBytes) {
+      if (Buffer.byteLength(request.body.question, "utf8") > config.consult.maxQuestionBytes || attachments.length > MAX_CONSULT_ATTACHMENTS || attachmentBytes(attachments) > config.consult.maxAttachmentBytes) {
         throw new ConsultFailure("too_large", "question or attachments exceed the configured limit");
       }
       if (!this.#bucket.take(config.consult.ratePerMinute, Date.now())) {
